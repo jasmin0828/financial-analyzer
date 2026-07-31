@@ -1,0 +1,31 @@
+name: Test
+
+# 每次 push 自动跑测试
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest  # 测试用 Linux runner 即可（更快、更便宜）
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 安装依赖（不含 PyQt5，测试用不到）
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl pdfplumber xlrd
+
+      - name: 🧪 运行测试
+        run: python test_logic.py
