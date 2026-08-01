@@ -257,8 +257,14 @@ class MainWindow(QMainWindow):
         self.errors = errors
 
         # 标签 1: 提取数据
-        data_text = json.dumps(data_by_year, ensure_ascii=False,
-                               indent=2, default=str)
+        # tuple keys 转字符串（json.dumps 不支持 tuple key）
+        def _stringify_keys(obj):
+            if isinstance(obj, dict):
+                return {str(k) if isinstance(k, tuple) else k: v
+                        for k, v in obj.items()}
+            return obj
+        data_text = json.dumps(_stringify_keys(data_by_year),
+                               ensure_ascii=False, indent=2, default=str)
         self.data_view.setText(data_text)
 
         # 标签 2: 财务指标
@@ -286,8 +292,13 @@ class MainWindow(QMainWindow):
         """格式化指标显示文本"""
         lines = [f"📊 财务指标（按年并列）", "=" * 80, ""]
         for year in years:
+            # 年份转为可读字符串
+            if isinstance(year, tuple):
+                year_str = f"{year[0]}-{str(year[1]).zfill(2)}"
+            else:
+                year_str = str(year)
             indicators = indicators_by_year.get(year, {})
-            lines.append(f"━━━ {year} 年 ({len(indicators)} 项) ━━━")
+            lines.append(f"━━━ {year_str} 年 ({len(indicators)} 项) ━━━")
             for k, v in indicators.items():
                 if isinstance(v, str):
                     lines.append(f"  {k:42s} | {v}")
@@ -308,15 +319,28 @@ class MainWindow(QMainWindow):
         for k, t in trends.items():
             lines.append(f"━━━ {k} ━━━")
             for year, v in t["values"]:
-                if v is None:
-                    lines.append(f"  {year}: -")
+                if isinstance(year, tuple):
+                    year_str = f"{year[0]}-{str(year[1]).zfill(2)}"
                 else:
-                    lines.append(f"  {year}: {v:>14,.2f}")
+                    year_str = str(year)
+                if v is None:
+                    lines.append(f"  {year_str}: -")
+                else:
+                    lines.append(f"  {year_str}: {v:>14,.2f}")
             for yoy in t["yoy"]:
+                yoy_year = yoy['year']
+                if isinstance(yoy_year, tuple):
+                    yoy_year = f"{yoy_year[0]}-{str(yoy_year[1]).zfill(2)}"
                 lines.append(
-                    f"  {yoy['year']} YoY: {yoy['direction']} {yoy['yoy']:+.2f}%")
+                    f"  {yoy_year} YoY: {yoy['direction']} {yoy['yoy']:+.2f}%")
             if t["cagr"] is not None:
-                n = t["values"][-1][0] - t["values"][0][0]
+                # 计算年份差（处理 tuple）
+                first_y = t["values"][0][0]
+                last_y = t["values"][-1][0]
+                if isinstance(first_y, tuple):
+                    n = last_y[0] - first_y[0]
+                else:
+                    n = last_y - first_y
                 lines.append(f"  {n}年 CAGR: {t['cagr']:+.2f}%")
             lines.append("")
         return "\n".join(lines)
@@ -377,7 +401,35 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
 
 
+def global_exception_handler(exc_type, exc_value, exc_tb):
+    """全局异常处理：捕获所有未处理异常，防止强制退出"""
+    import traceback
+    error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    print("=" * 60)
+    print("💥 未捕获异常:")
+    print(error_msg)
+    print("=" * 60)
+    # 写入文件供调试
+    try:
+        with open("/tmp/financial_analyzer_error.log", "w", encoding="utf-8") as f:
+            f.write(error_msg)
+    except Exception:
+        pass
+    # 尝试弹出错误对话框
+    try:
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.critical(
+            None, "错误",
+            f"程序出现未处理异常:\n\n{str(exc_value)[:500]}\n\n"
+            f"详细错误已保存到 /tmp/financial_analyzer_error.log")
+    except Exception:
+        pass
+
+
 def main():
+    # 安装全局异常处理
+    sys.excepthook = global_exception_handler
+
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
@@ -386,7 +438,13 @@ def main():
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_())
+
+    # 启动异常处理辅助线程
+    try:
+        sys.exit(app.exec_())
+    except Exception as e:
+        global_exception_handler(type(e), e, e.__traceback__)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
