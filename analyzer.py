@@ -547,6 +547,89 @@ def analyze_files(file_list):
 
 
 # ============================================================
+# 科目表提取（宽表 + 长表）
+# ============================================================
+
+# 报表类型中文映射
+SECTION_LABELS = {
+    "BS": ("资产负债表", "期末数"),
+    "IS": ("利润表", "本期数"),
+    "CF": ("现金流量表", "本期数"),
+}
+
+
+def extract_subjects_table(data_by_year, years):
+    """从多年财报数据提取标准化科目表
+
+    Returns:
+        (wide_table, long_table):
+        - wide_table: list of dict, 每条 {报表类型, 会计科目, 2023: v, 2024: v, ...}
+        - long_table: list of dict, 每条 {年份, 报表类型, 会计科目, 类别, 数值}
+    """
+    # 收集所有 (报表类型, 科目) 并排序
+    all_subjects = set()
+    for year in years:
+        data = data_by_year.get(year, {})
+        for section in ["BS", "IS", "CF"]:
+            for subject in data.get(section, {}).keys():
+                all_subjects.add((section, subject))
+
+    section_order = {"BS": 0, "IS": 1, "CF": 2}
+    sorted_subjects = sorted(
+        all_subjects,
+        key=lambda x: (section_order.get(x[0], 99), x[1]))
+
+    # 宽表：行=科目，列=年份
+    wide_table = []
+    for section, subject in sorted_subjects:
+        label, _ = SECTION_LABELS.get(section, (section, ""))
+        row = {"报表类型": label, "会计科目": subject}
+        for year in years:
+            data = data_by_year.get(year, {})
+            v = data.get(section, {}).get(subject)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            row[str(year)] = v
+        wide_table.append(row)
+
+    # 长表：每条记录一行
+    long_table = []
+    for year in years:
+        data = data_by_year.get(year, {})
+        for section, subject in sorted_subjects:
+            v = data.get(section, {}).get(subject)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            if v is None:
+                continue
+            label, kind = SECTION_LABELS.get(section, (section, ""))
+            long_table.append({
+                "年份": year,
+                "报表类型": label,
+                "会计科目": subject,
+                "类别": kind,
+                "数值": v,
+            })
+
+    return wide_table, long_table
+
+
+def export_subjects_to_csv(data_by_year, years, output_path):
+    """导出长格式科目表为 CSV（适合导入数据库/BI 工具）"""
+    import csv
+    _, long_table = extract_subjects_table(data_by_year, years)
+    if not long_table:
+        return False
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["年份", "报表类型",
+                                               "会计科目", "类别", "数值"])
+        writer.writeheader()
+        for row in long_table:
+            writer.writerow(row)
+    return True
+
+
+# ============================================================
 # 报告生成
 # ============================================================
 
@@ -566,8 +649,13 @@ def _header_style():
 
 
 def generate_report(data_by_year, indicators_by_year, years, trends,
-                    output_path, company_name="目标公司", errors=None):
-    """生成 Excel 报告（多年 + 趋势 + 图表）"""
+                    output_path, company_name="目标公司",
+                    analyst_name="", errors=None):
+    """生成 Excel 报告（多年 + 趋势 + 图表）
+
+    Args:
+        analyst_name: 分析人/作者名，会显示在首页
+    """
     wb = Workbook()
     style = _header_style()
     header_font = style["header_font"]
@@ -586,20 +674,28 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     ws0["A2"] = f"分析年份: {' / '.join(map(str, years))}  |  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     ws0["A2"].font = Font(italic=True, color="888888")
     ws0.merge_cells("A2:F2")
+    if analyst_name and analyst_name.strip():
+        ws0["A3"] = f"👤 分析人: {analyst_name.strip()}"
+        ws0["A3"].font = Font(bold=True, size=11, color="1F4E78")
+        ws0.merge_cells("A3:F3")
+        desc_start_row = 5
+    else:
+        desc_start_row = 4
 
-    ws0["A4"] = "⚠️ 数据说明"
-    ws0["A4"].font = Font(bold=True, size=12)
+    ws0.cell(row=desc_start_row, column=1, value="⚠️ 数据说明").font = Font(
+        bold=True, size=12)
     notes = [
         "本报告由本地程序自动生成，原始数据来自您提供的财报文件。",
         "本工具不联网、不上传数据，所有计算均在您的电脑上完成。",
         "财务指标的取数逻辑详见各 Sheet 注释，建议结合附注和审计意见综合判断。",
         "趋势分析包含同比变化（YoY）和复合增长率（CAGR）。",
     ]
-    for i, note in enumerate(notes, 5):
+    for i, note in enumerate(notes, desc_start_row + 1):
         ws0.cell(row=i, column=1, value=f"  • {note}")
 
-    ws0["A10"] = "📊 报告结构"
-    ws0["A10"].font = Font(bold=True, size=12)
+    struct_start = desc_start_row + len(notes) + 2
+    ws0.cell(row=struct_start, column=1, value="📊 报告结构").font = Font(
+        bold=True, size=12)
     structure = [
         ("原始数据", "三大报表原始数据（按年并列）"),
         ("财务指标", "盈利/偿债/营运/现金流/杜邦分析（按年并列）"),
@@ -608,7 +704,7 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
         ("结构图表", "资产/负债/利润结构图"),
         ("数据校验", "资产负债表平衡校验、关键指标健康度"),
     ]
-    for i, (sheet, desc) in enumerate(structure, 12):
+    for i, (sheet, desc) in enumerate(structure, struct_start + 2):
         ws0.cell(row=i, column=1, value=sheet).font = Font(bold=True, color="1F4E78")
         ws0.cell(row=i, column=2, value=desc)
     ws0.column_dimensions["A"].width = 20
@@ -1073,6 +1169,74 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     ws4.column_dimensions["A"].width = 30
     ws4.column_dimensions["B"].width = 40
     ws4.column_dimensions["C"].width = 15
+
+    # ===== 科目表（宽格式）=====
+    wide_table, long_table = extract_subjects_table(data_by_year, years)
+    if wide_table:
+        ws_wide = wb.create_sheet("科目表(宽)")
+        # 表头
+        headers = ["报表类型", "会计科目"] + [str(y) for y in years]
+        for col, h in enumerate(headers, 1):
+            cell = ws_wide.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        # 数据 + 分类标题
+        row = 2
+        prev_section = None
+        for row_data in wide_table:
+            section = row_data["报表类型"]
+            if section != prev_section:
+                # 跨分类时空一行（首个分类前不空）
+                if prev_section is not None:
+                    row += 1
+                # 写分类标题
+                cell = ws_wide.cell(row=row, column=1, value=section)
+                cell.font = cat_font
+                cell.fill = cat_fill
+                ws_wide.merge_cells(
+                    start_row=row, start_column=1, end_row=row,
+                    end_column=len(years) + 2)
+                row += 1
+                prev_section = section
+            # 写数据
+            ws_wide.cell(row=row, column=1, value=row_data["报表类型"])
+            ws_wide.cell(row=row, column=2, value=row_data["会计科目"])
+            for col_idx, year in enumerate(years, 3):
+                v = row_data.get(str(year))
+                cell = ws_wide.cell(row=row, column=col_idx)
+                if v is None:
+                    cell.value = "-"
+                else:
+                    cell.value = v
+                    cell.number_format = "#,##0.00"
+            row += 1
+        ws_wide.column_dimensions["A"].width = 14
+        ws_wide.column_dimensions["B"].width = 32
+        for col_idx in range(3, len(years) + 3):
+            ws_wide.column_dimensions[get_column_letter(col_idx)].width = 18
+
+    # ===== 科目表（长格式）=====
+    if long_table:
+        ws_long = wb.create_sheet("科目表(长)")
+        headers = ["年份", "报表类型", "会计科目", "类别", "数值"]
+        for col, h in enumerate(headers, 1):
+            cell = ws_long.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        for i, row_data in enumerate(long_table, 2):
+            ws_long.cell(row=i, column=1, value=row_data["年份"])
+            ws_long.cell(row=i, column=2, value=row_data["报表类型"])
+            ws_long.cell(row=i, column=3, value=row_data["会计科目"])
+            ws_long.cell(row=i, column=4, value=row_data["类别"])
+            cell = ws_long.cell(row=i, column=5, value=row_data["数值"])
+            cell.number_format = "#,##0.00"
+        ws_long.column_dimensions["A"].width = 10
+        ws_long.column_dimensions["B"].width = 14
+        ws_long.column_dimensions["C"].width = 32
+        ws_long.column_dimensions["D"].width = 10
+        ws_long.column_dimensions["E"].width = 20
 
     wb.save(output_path)
 

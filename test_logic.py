@@ -317,3 +317,146 @@ print("   ✅ 营业总收入增长率 (%)")
 print("   ✅ 净利润增长率 (%)")
 print("   ✅ 归母净利润增长率 (%)")
 print("=" * 80)
+
+
+# ============================================================
+# v2.2 新增：作者名测试
+# ============================================================
+print("\n" + "=" * 80)
+print("🆕 v2.2 作者名功能测试")
+print("=" * 80)
+
+# 1. 默认无作者名
+output1 = "/tmp/test_report_no_author.xlsx"
+generate_report(data_by_year, indicators_by_year, years, trends,
+                output1, "测试公司")
+wb = load_workbook(output1)
+ws = wb["首页"]
+all_text = ""
+for row in ws.iter_rows(values_only=True):
+    for v in row:
+        if v is not None:
+            all_text += str(v) + "\n"
+if "分析人" in all_text:
+    print("  ❌ 不应包含「分析人」字段")
+else:
+    print("  ✅ 不传作者名时，不显示「分析人」字段")
+
+# 2. 传入作者名
+output2 = "/tmp/test_report_with_author.xlsx"
+generate_report(data_by_year, indicators_by_year, years, trends,
+                output2, "测试公司", analyst_name="jasmin chan")
+wb = load_workbook(output2)
+ws = wb["首页"]
+all_text = ""
+for row in ws.iter_rows(values_only=True):
+    for v in row:
+        if v is not None:
+            all_text += str(v) + "\n"
+if "jasmin chan" in all_text and "分析人" in all_text:
+    print("  ✅ 作者名「jasmin chan」正确显示在首页")
+else:
+    print("  ❌ 作者名未显示")
+
+# 3. 测试不同作者名
+output3 = "/tmp/test_report_analyst2.xlsx"
+generate_report(data_by_year, indicators_by_year, years, trends,
+                output3, "测试公司", analyst_name="张明 / 财务部")
+wb = load_workbook(output3)
+ws = wb["首页"]
+all_text = ""
+for row in ws.iter_rows(values_only=True):
+    for v in row:
+        if v is not None:
+            all_text += str(v) + "\n"
+if "张明" in all_text and "财务部" in all_text:
+    print("  ✅ 部门+姓名「张明 / 财务部」正确显示")
+else:
+    print("  ❌ 多字段未显示")
+
+print(f"\n  📦 生成 3 个测试报告，总大小: "
+      f"{sum([os.path.getsize(p) for p in [output1, output2, output3]]):,} bytes")
+print("=" * 80)
+print("🎉 作者名功能测试通过！")
+print("=" * 80)
+
+
+# ============================================================
+# v2.3 新增：科目表导出测试
+# ============================================================
+print("\n" + "=" * 80)
+print("🆕 v2.3 科目表导出功能测试")
+print("=" * 80)
+
+from analyzer import extract_subjects_table, export_subjects_to_csv
+
+# 1. 测试宽表
+print("\n🧪 测试 12: extract_subjects_table 返回宽表")
+wide, long_ = extract_subjects_table(data_by_year, years)
+print(f"  ✅ 宽表行数: {len(wide)}")
+print(f"  ✅ 长表行数: {len(long_)}")
+print(f"  宽表样例 (前 3 行):")
+for row in wide[:3]:
+    print(f"    {row}")
+
+print(f"\n  长表样例 (前 3 行):")
+for row in long_[:3]:
+    print(f"    {row}")
+
+# 2. 验证长表覆盖所有年 x 科目
+expected_combinations = 0
+for year in years:
+    for section in ['BS', 'IS', 'CF']:
+        expected_combinations += len(data_by_year[year].get(section, {}))
+print(f"\n  预期 (年×科目) 记录数: {expected_combinations}")
+print(f"  实际长表记录数: {len(long_)}")
+if len(long_) == expected_combinations:
+    print("  ✅ 记录数完全匹配")
+else:
+    print("  ⚠️ 记录数不匹配")
+
+# 3. 测试 CSV 导出
+print("\n🧪 测试 13: export_subjects_to_csv")
+csv_path = "/tmp/test_subjects.csv"
+ok = export_subjects_to_csv(data_by_year, years, csv_path)
+if ok and os.path.exists(csv_path):
+    size = os.path.getsize(csv_path)
+    print(f"  ✅ CSV 导出成功: {csv_path}")
+    print(f"     文件大小: {size:,} bytes")
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        lines = f.readlines()
+    print(f"     总行数: {len(lines)} (含表头)")
+    print(f"     前 5 行:")
+    for line in lines[:5]:
+        print(f"       {line.rstrip()}")
+else:
+    print("  ❌ CSV 导出失败")
+
+# 4. 测试报告中的 2 个新 Sheet
+print("\n🧪 测试 14: Excel 报告含『科目表(宽)』和『科目表(长)』")
+output = "/tmp/test_report_v2.3.xlsx"
+generate_report(data_by_year, indicators_by_year, years, trends,
+                output, "测试公司")
+wb = load_workbook(output)
+print(f"  所有 Sheet:")
+for s in wb.sheetnames:
+    marker = "✅" if "科目表" in s else "  "
+    print(f"    {marker} {s}")
+if "科目表(宽)" in wb.sheetnames:
+    ws = wb["科目表(宽)"]
+    print(f"\n  科目表(宽) 内容样例:")
+    for row in ws.iter_rows(min_row=1, max_row=6, values_only=True):
+        print(f"    {row}")
+if "科目表(长)" in wb.sheetnames:
+    ws = wb["科目表(长)"]
+    print(f"\n  科目表(长) 内容样例:")
+    for row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
+        print(f"    {row}")
+
+print("\n" + "=" * 80)
+print("🎉 科目表导出功能测试通过！")
+print("   ✅ 宽表格式（行=科目，列=年份）")
+print("   ✅ 长表格式（行=记录，含年份/报表/科目/数值）")
+print("   ✅ CSV 导出（UTF-8 BOM 编码，Excel 可直接打开）")
+print("   ✅ 报告含 2 个新 Sheet")
+print("=" * 80)

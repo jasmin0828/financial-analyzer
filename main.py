@@ -22,7 +22,8 @@ from PyQt5.QtGui import QFont, QColor
 from analyzer import (
     extract_from_excel, extract_from_pdf,
     calculate_indicators, calculate_trends,
-    generate_report, analyze_files, detect_year_from_filename
+    generate_report, analyze_files, detect_year_from_filename,
+    export_subjects_to_csv
 )
 
 
@@ -98,6 +99,22 @@ class MainWindow(QMainWindow):
         subtitle.setStyleSheet("color: #888; padding-bottom: 4px;")
         layout.addWidget(subtitle)
 
+        # 作者信息（固定署名）
+        author_layout = QHBoxLayout()
+        author_label = QLabel("👤  作者:")
+        author_label.setStyleSheet(
+            "color: #1F4E78; font-weight: bold; font-size: 14px;")
+        author_layout.addStretch()
+        author_layout.addWidget(author_label)
+        author_name = QLabel("Jasmin Alpha Hunter")
+        author_name.setStyleSheet(
+            "color: #1F4E78; font-weight: bold; font-size: 16px; "
+            "padding: 4px 12px; background: #F0F8FF; "
+            "border: 1px solid #B0C4DE; border-radius: 4px;")
+        author_layout.addWidget(author_name)
+        author_layout.addStretch()
+        layout.addLayout(author_layout)
+
         # ① 文件选择（多文件）
         file_group = QGroupBox("① 添加财报文件（可多个，建议文件名含年份如 2023年报.pdf）")
         file_layout = QVBoxLayout(file_group)
@@ -148,6 +165,16 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_report)
         self.btn_export.setEnabled(False)
         op_layout.addWidget(self.btn_export)
+
+        self.btn_export_csv = QPushButton("📋 导出科目表 (CSV)")
+        self.btn_export_csv.setStyleSheet(
+            "background: #548235; color: white; padding: 10px; "
+            "font-weight: bold; font-size: 14px;")
+        self.btn_export_csv.setToolTip(
+            "导出长格式科目表为 CSV（适合导入数据库 / Excel 透视 / BI 工具）")
+        self.btn_export_csv.clicked.connect(self.export_subjects_csv)
+        self.btn_export_csv.setEnabled(False)
+        op_layout.addWidget(self.btn_export_csv)
 
         op_layout.addStretch()
         op_layout.addWidget(QLabel("💡 数据仅在本机处理，不会上传到任何服务器"))
@@ -244,6 +271,7 @@ class MainWindow(QMainWindow):
 
         self.btn_analyze.setEnabled(True)
         self.btn_export.setEnabled(True)
+        self.btn_export_csv.setEnabled(True)
         self.progress_bar.setVisible(False)
 
         msg = f"分析完成！\n\n覆盖 {len(years)} 年: {', '.join(map(str, years))}\n"
@@ -308,10 +336,11 @@ class MainWindow(QMainWindow):
             self, "保存报告", default_name, "Excel Files (*.xlsx)")
         if path:
             try:
+                # 报告内不显示作者名（仅在 GUI 界面显示）
                 generate_report(
                     self.data_by_year, self.indicators_by_year,
                     self.years, self.trends, path,
-                    "财务分析报告", self.errors)
+                    "财务分析报告", "", self.errors)
                 QMessageBox.information(
                     self, "成功",
                     f"报告已保存到:\n{path}\n\n"
@@ -319,6 +348,33 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"报告已保存: {path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def export_subjects_csv(self):
+        """导出长格式科目表为 CSV"""
+        if not self.data_by_year:
+            return
+        default_name = (f"科目表_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        f".csv")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存科目表", default_name, "CSV Files (*.csv)")
+        if path:
+            try:
+                ok = export_subjects_to_csv(
+                    self.data_by_year, self.years, path)
+                if ok:
+                    QMessageBox.information(
+                        self, "成功",
+                        f"科目表已导出到:\n{path}\n\n"
+                        f"格式: 长格式（年份/报表类型/会计科目/类别/数值）\n"
+                        f"共 {len(self.years)} 年数据\n"
+                        f"可直接用 Excel 打开，或导入数据库 / Power BI")
+                    self.statusBar().showMessage(f"CSV 已导出: {path}")
+                else:
+                    QMessageBox.warning(
+                        self, "无数据",
+                        "未能提取到任何科目数据，请检查原始财报文件")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
 
 
 def main():
