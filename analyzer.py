@@ -97,12 +97,38 @@ CF_ITEMS = {
 # ============================================================
 
 def detect_year_from_filename(filepath):
-    """从文件名识别年份（如 2023年报.pdf → 2023）"""
+    """从文件名识别年份（如 2023年报.pdf → 2023）
+
+    支持格式：
+    - 2023年报.pdf → 2023
+    - 2025年12月利润表.xlsx → 2025
+    - 2026年3月资产负债表.xlsx → 2026
+    - annual_report_2025.pdf → 2025
+    """
     name = Path(filepath).stem
     m = re.search(r'(20\d{2})', name)
     if m:
         return int(m.group(1))
     return None
+
+
+def detect_period_from_filename(filepath):
+    """从文件名识别期间（年份 + 月份）
+
+    Returns:
+        (year, month) 元组，如 (2025, 12) 或 (2026, 3)
+        如果识别不出月份，返回 (year, 12)（默认年末）
+    """
+    name = Path(filepath).stem
+    # 格式: 2025年12月 / 2026年3月 / 2025-12
+    m = re.search(r'(20\d{2})年?[-_]?(\d{1,2})月?', name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # 只有年份，默认为 12 月
+    m = re.search(r'(20\d{2})', name)
+    if m:
+        return int(m.group(1)), 12
+    return None, None
 
 
 def detect_year_from_sheet(sheet_name):
@@ -113,12 +139,30 @@ def detect_year_from_sheet(sheet_name):
     return None
 
 
+def detect_period_from_sheet(sheet_name):
+    """从 sheet 名识别期间（年份+月份）"""
+    m = re.search(r'(20\d{2})年?[-_]?(\d{1,2})月?', sheet_name)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r'(20\d{2})', sheet_name)
+    if m:
+        return int(m.group(1)), 12
+    return None, None
+
+
 # ============================================================
 # 数据提取
 # ============================================================
 
 def extract_from_excel(filepath, year=None):
-    """从 Excel 财报中提取财务数据"""
+    """从 Excel 财报中提取财务数据（智能识别布局）
+
+    支持：
+    - 单个 sheet 含 3 张表（按 sheet 名识别）
+    - 多个 sheet 各含一张表（按 sheet 名识别）
+    - A 股标准双栏布局资产负债表（资产左、负债右）
+    - 智能根据内容识别 sheet 类型
+    """
     result = {}
     try:
         xls = pd.ExcelFile(filepath, engine='openpyxl')
@@ -132,14 +176,225 @@ def extract_from_excel(filepath, year=None):
         except Exception:
             continue
 
-        if any(kw in sheet_name for kw in ["资产负债表", "Balance Sheet", "BS"]):
-            result['BS'] = parse_table(df, BS_ITEMS)
-        elif any(kw in sheet_name for kw in ["利润表", "损益表",
-                                            "Income Statement", "IS"]):
-            result['IS'] = parse_table(df, IS_ITEMS)
-        elif any(kw in sheet_name for kw in ["现金流量表", "Cash Flow", "CF"]):
-            result['CF'] = parse_table(df, CF_ITEMS)
+        # 智能识别 sheet 类型
+        section_type = detect_sheet_type(sheet_name, df)
+        if section_type is None:
+            continue
+
+        # 检测双栏布局（主要针对资产负债表）
+        if section_type == "BS" and is_dual_column_layout(df):
+            end_data, start_data = extract_dual_column_bs(df)
+            extracted = end_data
+            # 年初余额用 __prev__ 标记，后面由 analyze_files 移到上一年
+            for k, v in start_data.items():
+                extracted[f"__prev__{k}"] = v
+        else:
+            item_dict = {"BS": BS_ITEMS,
+                         "IS": IS_ITEMS,
+                         "CF": CF_ITEMS}[section_type]
+            extracted = parse_table(df, item_dict)
+
+        # 合并：保留已有数据，新数据只补充
+        if section_type in result:
+            for k, v in extracted.items():
+                if k not in result[section_type]:
+                    result[section_type][k] = v
+        else:
+            result[section_type] = extracted
     return result
+
+
+def detect_sheet_type(sheet_name, df):
+    """智能识别 sheet 是 BS/IS/CF 中的哪一种"""
+    # 先看 sheet 名
+    name_lower = sheet_name.lower()
+    if any(kw in sheet_name for kw in ["资产负债表", "资负表", "BS", "Balance Sheet"]):
+        return "BS"
+    if any(kw in sheet_name for kw in ["利润表", "损益表", "收益表", "IS",
+                                       "Income Statement", "Profit"]):
+        return "IS"
+    if any(kw in sheet_name for kw in ["现金流量表", "现金流", "CF", "Cash Flow"]):
+        return "CF"
+
+    # 看内容（前 10 行）
+    try:
+        head_text = ""
+        for _, row in df.head(10).iterrows():
+            for v in row.values:
+                if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    head_text += str(v) + " "
+        # 资产负债表特征：同时有“资产”、“负债”
+        if "资产" in head_text and "负债" in head_text and "所有者权益" in head_text:
+            return "BS"
+        if "营业收入" in head_text or "营业成本" in head_text:
+            return "IS"
+        if "经营活动" in head_text and "现金流量" in head_text:
+            return "CF"
+    except Exception:
+        pass
+    return None
+
+
+def is_dual_column_layout(df):
+    """检测是否是双栏布局（A 股标准资产负债表）"""
+    for _, row in df.head(20).iterrows():
+        row_str = " ".join([str(v) for v in row.values
+                            if v is not None and not (isinstance(v, float) and pd.isna(v))])
+        if "资产" in row_str and "负债" in row_str and ("期末" in row_str or "余额" in row_str):
+            return True
+    return False
+
+
+def parse_value(v):
+    """解析单元格值为数字"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    s = str(v).strip()
+    if not s or s in ("-", "--", "—", "－", ""):
+        return None
+    s_clean = s.replace(",", "").replace("，", "").replace(" ", "").replace("\u3000", "")
+    s_clean = s_clean.replace("(", "-").replace(")", "")
+    s_clean = s_clean.replace("（", "-").replace("）", "")
+    try:
+        return float(s_clean)
+    except ValueError:
+        return None
+
+
+def extract_dual_column_bs(df):
+    """从双栏布局的资产负债表中提取数据（同时获取期末 + 年初）
+
+    双栏布局：A 股标准
+    - 左侧：资产（列 A: 科目 / B: 行次 / C: 期末余额 / D: 年初余额）
+    - 右侧：负债和所有者权益（列 E: 科目 / F: 行次 / G: 期末余额 / H: 年初余额）
+
+    Returns:
+        (end_data, start_data) 元组
+        - end_data: {科目: 期末余额} （本期数）
+        - start_data: {科目: 年初余额} （上年末数）
+    """
+    end_data = {}
+    start_data = {}
+
+    # 找表头行
+    header_row_idx = None
+    for i, row in df.iterrows():
+        row_str = " ".join([str(v) for v in row.values
+                            if v is not None and not (isinstance(v, float) and pd.isna(v))])
+        if "资产" in row_str and "负债" in row_str and ("期末" in row_str or "余额" in row_str):
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        return end_data, start_data
+
+    # 找列索引
+    header_row = df.iloc[header_row_idx]
+    asset_col = None       # 资产科目列
+    asset_end_col = None   # 资产期末余额
+    asset_start_col = None  # 资产年初余额
+    liab_col = None         # 负债科目列
+    liab_end_col = None     # 负债期末余额
+    liab_start_col = None   # 负债年初余额
+
+    for col_idx, val in header_row.items():
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        val_str = str(val).strip()
+        # 资产列
+        if val_str == "资产" or val_str.startswith("资产"):
+            if asset_col is None:
+                asset_col = col_idx
+        # 负债列
+        elif "负债" in val_str and "所有者权益" in val_str:
+            if liab_col is None and asset_col is not None:
+                liab_col = col_idx
+        # 期末余额列
+        elif "期末" in val_str:
+            if asset_end_col is None:
+                asset_end_col = col_idx
+            elif liab_end_col is None:
+                liab_end_col = col_idx
+        # 年初余额列
+        elif "年初" in val_str:
+            if asset_start_col is None:
+                asset_start_col = col_idx
+            elif liab_start_col is None:
+                liab_start_col = col_idx
+
+    if asset_col is None or liab_col is None:
+        return end_data, start_data
+
+    # 默认列位置兑底（资产科后两列是期末/年初；负债同样）
+    if asset_end_col is None:
+        asset_end_col = asset_col + 2
+    if liab_end_col is None:
+        liab_end_col = liab_col + 2
+    if asset_start_col is None:
+        asset_start_col = asset_end_col + 1 if asset_end_col else asset_col + 3
+    if liab_start_col is None:
+        liab_start_col = liab_end_col + 1 if liab_end_col else liab_col + 3
+
+    # 提取数据
+    for i, row in df.iterrows():
+        if i <= header_row_idx:
+            continue
+
+        # 提取资产
+        try:
+            asset_name = row.iloc[asset_col] if asset_col < len(row) else None
+        except (IndexError, AttributeError):
+            asset_name = None
+        if asset_name and isinstance(asset_name, str):
+            try:
+                asset_end_value = row.iloc[asset_end_col] \
+                    if asset_end_col < len(row) else None
+            except (IndexError, AttributeError):
+                asset_end_value = None
+            try:
+                asset_start_value = row.iloc[asset_start_col] \
+                    if asset_start_col < len(row) else None
+            except (IndexError, AttributeError):
+                asset_start_value = None
+            asset_end_value = parse_value(asset_end_value)
+            asset_start_value = parse_value(asset_start_value)
+            if asset_end_value is not None or asset_start_value is not None:
+                for std_name, keywords in BS_ITEMS.items():
+                    if any(kw in asset_name for kw in keywords):
+                        if asset_end_value is not None:
+                            end_data[std_name] = asset_end_value
+                        if asset_start_value is not None:
+                            start_data[std_name] = asset_start_value
+                        break
+
+        # 提取负债/所有者权益
+        try:
+            liab_name = row.iloc[liab_col] if liab_col < len(row) else None
+        except (IndexError, AttributeError):
+            liab_name = None
+        if liab_name and isinstance(liab_name, str):
+            try:
+                liab_end_value = row.iloc[liab_end_col] \
+                    if liab_end_col < len(row) else None
+            except (IndexError, AttributeError):
+                liab_end_value = None
+            try:
+                liab_start_value = row.iloc[liab_start_col] \
+                    if liab_start_col < len(row) else None
+            except (IndexError, AttributeError):
+                liab_start_value = None
+            liab_end_value = parse_value(liab_end_value)
+            liab_start_value = parse_value(liab_start_value)
+            if liab_end_value is not None or liab_start_value is not None:
+                for std_name, keywords in BS_ITEMS.items():
+                    if any(kw in liab_name for kw in keywords):
+                        if liab_end_value is not None:
+                            end_data[std_name] = liab_end_value
+                        if liab_start_value is not None:
+                            start_data[std_name] = liab_start_value
+                        break
+
+    return end_data, start_data
 
 
 def parse_table(df, item_dict):
@@ -152,13 +407,14 @@ def parse_table(df, item_dict):
             if any(kw in row_str for kw in keywords):
                 numbers = extract_numbers_from_row(list(row.values))
                 if numbers:
-                    extracted[std_name] = numbers[0] if len(numbers) == 1 else numbers
+                    # 取绝对值最大的数字（业务金额通常最大）
+                    extracted[std_name] = max(numbers, key=abs)
                 break
     return extracted
 
 
 def extract_numbers_from_row(values):
-    """从一行单元格中提取数字"""
+    """从一行单元格中提取数字（智能跳过行次列）"""
     numbers = []
     for v in values:
         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -170,9 +426,12 @@ def extract_numbers_from_row(values):
         s_clean = s_clean.replace("(", "-").replace(")", "")
         try:
             num = float(s_clean)
-            numbers.append(num)
         except ValueError:
             continue
+        # 跳过行次列（1-150 范围的纯整数通常不是金额）
+        if 1 <= num <= 150 and num == int(num):
+            continue
+        numbers.append(num)
     return numbers
 
 
@@ -419,8 +678,8 @@ def calculate_trends(indicators_by_year, years):
     计算各指标的趋势（同比 YoY、CAGR 复合增长率、变化方向）
 
     Args:
-        indicators_by_year: {year: {indicator: value}}
-        years: 排序后的年份列表
+        indicators_by_year: {year: {indicator: value}}，key 可以是 int 或 (year, month)
+        years: 排序后的年份/期间列表
 
     Returns:
         {indicator: {
@@ -431,6 +690,12 @@ def calculate_trends(indicators_by_year, years):
     """
     if not years or len(years) < 1:
         return {}
+
+    def get_year_part(key):
+        """从 key 中提取年份部分（int 或 (int, int)）"""
+        if isinstance(key, tuple):
+            return key[0]
+        return key
 
     trends = {}
     all_indicators = set()
@@ -443,7 +708,7 @@ def calculate_trends(indicators_by_year, years):
             v = indicators_by_year.get(year, {}).get(indicator)
             values.append((year, v))
 
-        # 同比 YoY
+        # 同比 YoY（跨期比较只看年份差）
         yoy_list = []
         for i in range(1, len(values)):
             prev_year, prev_v = values[i - 1]
@@ -456,13 +721,15 @@ def calculate_trends(indicators_by_year, years):
                     "direction": "↑" if yoy > 0.5 else ("↓" if yoy < -0.5 else "→")
                 })
 
-        # CAGR
+        # CAGR（用年份差作 n）
         cagr = None
         first_year, first_v = values[0]
         last_year, last_v = values[-1]
+        first_y = get_year_part(first_year)
+        last_y = get_year_part(last_year)
         if (first_v is not None and last_v is not None
                 and first_v > 0 and last_v > 0 and len(years) >= 2):
-            n = last_year - first_year
+            n = last_y - first_y
             if n > 0:
                 cagr_pow = pow(last_v / first_v, 1 / n)
                 cagr = (cagr_pow - 1) * 100
@@ -498,9 +765,11 @@ def analyze_files(file_list):
     """
     data_by_year = {}
     errors = []
+    # 暂存 __prev__ 标记的“年初余额”数据，在合并后补充到上一年
+    prev_pending = []
 
     for filepath in file_list:
-        year = detect_year_from_filename(filepath)
+        year, month = detect_period_from_filename(filepath)
         ext = Path(filepath).suffix.lower()
         try:
             if ext in ['.xlsx', '.xls']:
@@ -519,26 +788,74 @@ def analyze_files(file_list):
                 errors.append((filepath, "未能提取到任何数据"))
                 continue
 
+            # 处理 __prev__ 标记的“年初余额”数据
+            for section in ['BS', 'IS', 'CF']:
+                if section in data:
+                    prev_keys = [k for k in data[section]
+                                 if k.startswith('__prev__')]
+                    for k in prev_keys:
+                        clean_k = k.replace('__prev__', '')
+                        if year is not None:
+                            prev_pending.append({
+                                'section': section,
+                                'key': clean_k,
+                                'value': data[section][k],
+                                'from_year': year,
+                                'from_month': month,
+                            })
+                        # 从当前数据中删除（不当作本年数）
+                        del data[section][k]
+
             # 如果识别不到年份，用当前年
             if year is None:
                 year = datetime.now().year
 
-            # 避免同一年多份文件被覆盖
-            if year in data_by_year:
+            # 避免同年多份文件被覆盖：按 “年份-月份” 作为 key
+            year_key = (year, month) if month else year
+            if year_key in data_by_year:
                 # 合并
                 for section in ['BS', 'IS', 'CF']:
                     if section in data:
-                        data_by_year[year].setdefault(section, {}).update(data[section])
+                        data_by_year[year_key].setdefault(
+                            section, {}).update(data[section])
             else:
-                data_by_year[year] = data
+                data_by_year[year_key] = data
 
         except Exception as e:
             errors.append((filepath, f"{str(e)}\n{traceback.format_exc()}"))
 
+    # 补充“年初余额”到上一年末（仅在用户没提供的情况下）
+    # 重要：年初余额总是上一年末（如 2026-3 BS 的年初 = 2025-12-31）
+    for prev in prev_pending:
+        # 年初余额是上一个资产负债表日，默认是上一年 12 月
+        prev_year_key = (prev['from_year'] - 1, 12)
+        if prev_year_key not in data_by_year:
+            data_by_year[prev_year_key] = {}
+        if prev['section'] not in data_by_year[prev_year_key]:
+            data_by_year[prev_year_key][prev['section']] = {}
+        # 仅在用户没提供该数据时补充
+        if prev['key'] not in data_by_year[prev_year_key][prev['section']]:
+            data_by_year[prev_year_key][prev['section']][prev['key']] = prev['value']
+
+    # 年份排序（可能是 int 或 (int, int)）
     years = sorted(data_by_year.keys())
+
+    # 标准化：把所有 list 值转为单个 float（取绝对值最大）
+    for year_key, data in data_by_year.items():
+        for section in ['BS', 'IS', 'CF']:
+            if section in data:
+                for k, v in list(data[section].items()):
+                    if isinstance(v, list):
+                        nums = [x for x in v if isinstance(x, (int, float))]
+                        data[section][k] = max(nums, key=abs) if nums else None
     indicators_by_year = {}
     for year in years:
-        prev_data = data_by_year.get(year - 1)
+        # 上一年：可能跨年跳
+        if isinstance(year, tuple):
+            prev_year_key = (year[0] - 1, year[1])
+        else:
+            prev_year_key = year - 1
+        prev_data = data_by_year.get(prev_year_key)
         indicators_by_year[year] = calculate_indicators(
             data_by_year[year], prev_data=prev_data)
     trends = calculate_trends(indicators_by_year, years)
@@ -1226,13 +1543,17 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
         for i, row_data in enumerate(long_table, 2):
-            ws_long.cell(row=i, column=1, value=row_data["年份"])
+            # 年份可能是 tuple，统一转为字符串
+            year_val = row_data["年份"]
+            if isinstance(year_val, tuple):
+                year_val = f"{year_val[0]}-{str(year_val[1]).zfill(2)}"
+            ws_long.cell(row=i, column=1, value=year_val)
             ws_long.cell(row=i, column=2, value=row_data["报表类型"])
             ws_long.cell(row=i, column=3, value=row_data["会计科目"])
             ws_long.cell(row=i, column=4, value=row_data["类别"])
             cell = ws_long.cell(row=i, column=5, value=row_data["数值"])
             cell.number_format = "#,##0.00"
-        ws_long.column_dimensions["A"].width = 10
+        ws_long.column_dimensions["A"].width = 12
         ws_long.column_dimensions["B"].width = 14
         ws_long.column_dimensions["C"].width = 32
         ws_long.column_dimensions["D"].width = 10
