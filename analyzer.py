@@ -826,8 +826,20 @@ def analyze_files(file_list):
                     if section in data:
                         data_by_year[year_key].setdefault(
                             section, {}).update(data[section])
+                # 记录每个 section 的源文件路径
+                for section in ['BS', 'IS', 'CF']:
+                    if section in data and data[section]:
+                        data_by_year[year_key].setdefault(
+                            '__files__', {})[section] = str(filepath)
+                        break  # 一个文件对应一个 section
             else:
                 data_by_year[year_key] = data
+                # 记录每个 section 的源文件路径
+                for section in ['BS', 'IS', 'CF']:
+                    if section in data and data[section]:
+                        data_by_year[year_key].setdefault(
+                            '__files__', {})[section] = str(filepath)
+                        break
 
         except Exception as e:
             errors.append((filepath, f"{str(e)}\n{traceback.format_exc()}"))
@@ -961,6 +973,333 @@ def export_subjects_to_csv(data_by_year, years, output_path):
 
 
 # ============================================================
+# 原始报表(万元)提取
+# ============================================================
+
+def extract_raw_table_wan(file_path, sheet_type="BS", divide_by=10000):
+    """从原始 Excel 提取所有行
+
+    保留完整的原始科目结构（不标准化），包括：
+    - 所有非标准科目（如"短期投资""预付款项""累计折旧"等）
+    - 分类标题行（如"流动资产：""非流动资产：")
+    - 空行
+
+    Args:
+        file_path: Excel 文件路径
+        sheet_type: 'BS'（资产负债表）或 'IS'（利润表）或 'CF'（现金流量表）
+        divide_by: 数值除数，默认 10000（转万元），传 1 保持原始单位（元）
+
+    Returns:
+        rows: list of dict
+            {
+                'side': 'L' / 'R',  # 双栏布局：左/右侧；单栏：'L'
+                'row_type': 'data' / 'header' / 'blank',
+                'account': 科目名（可能为空）,
+                'row_no': 行次（如果有）,
+                'end_val': 期末值（divide_by 后）,
+                'start_val': 年初值（divide_by 后，如果有）,
+            }
+    """
+    df = pd.read_excel(file_path, header=None, dtype=str)
+    rows = []
+
+    if sheet_type == "BS" and is_dual_column_layout(df):
+        # 找列位置
+        header_row_idx = None
+        for i, row in df.iterrows():
+            row_str = " ".join([str(v) for v in row.values
+                                if v is not None and not (isinstance(v, float) and pd.isna(v))])
+            if "资产" in row_str and "负债" in row_str and ("期末" in row_str or "余额" in row_str):
+                header_row_idx = i
+                break
+
+        if header_row_idx is None:
+            return rows
+
+        header_row = df.iloc[header_row_idx]
+        asset_col = None
+        asset_end_col = None
+        asset_start_col = None
+        asset_row_col = None  # 行次
+        liab_col = None
+        liab_end_col = None
+        liab_start_col = None
+        liab_row_col = None
+
+        for col_idx, val in header_row.items():
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            val_str = str(val).strip()
+            if val_str == "资产" or val_str.startswith("资产"):
+                if asset_col is None:
+                    asset_col = col_idx
+            elif "负债" in val_str and "所有者权益" in val_str:
+                if liab_col is None and asset_col is not None:
+                    liab_col = col_idx
+            elif val_str == "行次":
+                if asset_row_col is None:
+                    asset_row_col = col_idx
+                elif liab_row_col is None:
+                    liab_row_col = col_idx
+            elif "期末" in val_str:
+                if asset_end_col is None:
+                    asset_end_col = col_idx
+                elif liab_end_col is None:
+                    liab_end_col = col_idx
+            elif "年初" in val_str:
+                if asset_start_col is None:
+                    asset_start_col = col_idx
+                elif liab_start_col is None:
+                    liab_start_col = col_idx
+
+        if asset_col is None:
+            asset_col = 0
+        if liab_col is None:
+            liab_col = 4
+        if asset_end_col is None:
+            asset_end_col = asset_col + 2
+        if liab_end_col is None:
+            liab_end_col = liab_col + 2
+        if asset_start_col is None:
+            asset_start_col = asset_end_col + 1
+        if liab_start_col is None:
+            liab_start_col = liab_end_col + 1
+
+        # 提取数据行（从表头下一行开始）
+        for i, row in df.iterrows():
+            if i <= header_row_idx:
+                continue
+
+            def _extract_side(name_col, end_col, start_col, row_col, side):
+                try:
+                    name = row.iloc[name_col] if name_col < len(row) else None
+                except (IndexError, AttributeError):
+                    name = None
+                try:
+                    end_v = parse_value(row.iloc[end_col]) if end_col < len(row) else None
+                except (IndexError, AttributeError):
+                    end_v = None
+                try:
+                    start_v = parse_value(row.iloc[start_col]) if start_col < len(row) else None
+                except (IndexError, AttributeError):
+                    start_v = None
+                try:
+                    row_no = None
+                    if row_col is not None and row_col < len(row):
+                        rv = row.iloc[row_col]
+                        if rv is not None:
+                            try:
+                                row_no = int(float(str(rv)))
+                            except (ValueError, TypeError):
+                                row_no = None
+                except (IndexError, AttributeError):
+                    row_no = None
+
+                if not name or not isinstance(name, str):
+                    return None
+
+                # 识别行类型
+                stripped = name.strip()
+                if not stripped:
+                    row_type = 'blank'
+                elif stripped.endswith('：') or stripped.endswith(':'):
+                    row_type = 'subheader'  # 分类标题
+                elif any(kw in stripped for kw in ['合计', '总计']):
+                    row_type = 'subtotal'
+                else:
+                    row_type = 'data'
+
+                end_val = round(end_v / divide_by, 2) if end_v is not None else None
+                start_val = round(start_v / divide_by, 2) if start_v is not None else None
+
+                return {
+                    'side': side,
+                    'row_type': row_type,
+                    'account': stripped,
+                    'row_no': row_no,
+                    'end_val': end_val,
+                    'start_val': start_val,
+                }
+
+            left = _extract_side(asset_col, asset_end_col, asset_start_col, asset_row_col, 'L')
+            if left:
+                rows.append(left)
+            right = _extract_side(liab_col, liab_end_col, liab_start_col, liab_row_col, 'R')
+            if right:
+                rows.append(right)
+    else:
+        # 单栏（IS / CF）
+        # 找表头
+        header_row_idx = None
+        for i, row in df.iterrows():
+            row_str = " ".join([str(v) for v in row.values
+                                if v is not None and not (isinstance(v, float) and pd.isna(v))])
+            if "项目" in row_str or "科目" in row_str or "本年" in row_str:
+                if any(kw in row_str for kw in ["行次", "金额", "累计"]):
+                    header_row_idx = i
+                    break
+        if header_row_idx is None:
+            # 退回到第 4 行
+            header_row_idx = 3
+
+        header_row = df.iloc[header_row_idx]
+        account_col = None
+        row_col = None
+        val_cols = []
+
+        for col_idx, val in header_row.items():
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            val_str = str(val).strip()
+            if val_str in ("项目", "科目") or "项目" in val_str:
+                if account_col is None:
+                    account_col = col_idx
+            elif val_str == "行次":
+                if row_col is None:
+                    row_col = col_idx
+            elif "金额" in val_str or "累计" in val_str:
+                val_cols.append(col_idx)
+
+        if account_col is None:
+            account_col = 0
+        if not val_cols:
+            # 默认第 3、4 列
+            val_cols = [account_col + 2, account_col + 3]
+
+        for i, row in df.iterrows():
+            if i <= header_row_idx:
+                continue
+            try:
+                name = row.iloc[account_col] if account_col < len(row) else None
+            except (IndexError, AttributeError):
+                continue
+            if not name or not isinstance(name, str):
+                continue
+            stripped = name.strip()
+            if not stripped:
+                continue
+
+            try:
+                row_no = None
+                if row_col is not None and row_col < len(row):
+                    rv = row.iloc[row_col]
+                    if rv is not None:
+                        try:
+                            row_no = int(float(str(rv)))
+                        except (ValueError, TypeError):
+                            row_no = None
+            except (IndexError, AttributeError):
+                row_no = None
+
+            vals = []
+            for vc in val_cols:
+                try:
+                    v = parse_value(row.iloc[vc]) if vc < len(row) else None
+                except (IndexError, AttributeError):
+                    v = None
+                vals.append(round(v / divide_by, 2) if v is not None else None)
+
+            if any(kw in stripped for kw in ['合计', '总计']):
+                row_type = 'subtotal'
+            elif stripped.endswith('：'):
+                row_type = 'subheader'
+            else:
+                row_type = 'data'
+
+            rows.append({
+                'side': 'L',
+                'row_type': row_type,
+                'account': stripped,
+                'row_no': row_no,
+                'values': vals,
+            })
+
+    return rows
+
+
+def extract_raw_table_wan_multi(file_info, years, sheet_type, divide_by=10000):
+    """从多年文件提取原始报表(万元)，按行次合并
+
+    Args:
+        file_info: {year: {section: filepath}} 文件路径字典
+        years: 排序后的年份列表
+        sheet_type: 'BS' / 'IS' / 'CF'
+        divide_by: 数值除数，10000 表示万元，1 表示元
+
+    Returns:
+        merged_rows: list of dict，每个 row 含
+            'account', 'row_no', 'row_type', 'side',
+            'values': {year: [end_val, start_val]} (BS) 或 {year: [val1, val2, ...]} (IS)
+    """
+    # 收集每个年份的文件
+    year_data = {}
+    for year in years:
+        if year in file_info and sheet_type in file_info[year]:
+            path = file_info[year][sheet_type]
+            try:
+                year_data[year] = extract_raw_table_wan(
+                    path, sheet_type, divide_by=divide_by)
+            except Exception:
+                year_data[year] = []
+
+    if not year_data:
+        return []
+
+    # 用最新年份作为模板（行结构）
+    template_year = years[-1]
+    if template_year not in year_data:
+        return []
+    template_rows = year_data[template_year]
+
+    # 合并：按 (side, row_no) 匹配
+    # 如果 row_no 是 None，用 account 匹配
+    merged = []
+    for tr in template_rows:
+        key = (tr['side'], tr['row_no'], tr['account'])
+        merged_row = {
+            'side': tr['side'],
+            'row_type': tr['row_type'],
+            'account': tr['account'],
+            'row_no': tr['row_no'],
+            'values': {}
+        }
+        # 模板年份的数据
+        if sheet_type == "BS":
+            merged_row['values'][template_year] = {
+                'end': tr.get('end_val'),
+                'start': tr.get('start_val'),
+            }
+        else:
+            merged_row['values'][template_year] = tr.get('values', [])
+
+        # 匹配其他年份
+        for other_year, other_rows in year_data.items():
+            if other_year == template_year:
+                continue
+            match = None
+            for or_ in other_rows:
+                if or_['side'] == tr['side'] and or_['account'] == tr['account']:
+                    if tr['row_no'] is not None and or_['row_no'] is not None and or_['row_no'] == tr['row_no']:
+                        match = or_
+                        break
+                    elif tr['row_no'] is None and or_['row_no'] is None:
+                        match = or_
+                        break
+            if match:
+                if sheet_type == "BS":
+                    merged_row['values'][other_year] = {
+                        'end': match.get('end_val'),
+                        'start': match.get('start_val'),
+                    }
+                else:
+                    merged_row['values'][other_year] = match.get('values', [])
+
+        merged.append(merged_row)
+
+    return merged
+
+
+# ============================================================
 # 报告生成
 # ============================================================
 
@@ -1051,52 +1390,282 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     ws0.column_dimensions["A"].width = 20
     ws0.column_dimensions["B"].width = 60
 
-    # ===== 原始数据 =====
+    # ===== 原始数据（元单位，保留所有原始行）=====
+    # 从 data_by_year 中提取 __files__ 信息
+    file_info = {}
+    for y in years:
+        yd = data_by_year.get(y, {})
+        if isinstance(yd, dict) and '__files__' in yd:
+            file_info[y] = yd['__files__']
+
+    # 原始数据 Sheet（元单位，保留所有原始行）
     ws1 = wb.create_sheet("原始数据")
-    headers = ["科目"] + [str(y) for y in years]
-    for col, h in enumerate(headers, 1):
-        cell = ws1.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # 收集所有出现的科目
-    all_items = {}
-    for year in years:
-        for section in ['BS', 'IS', 'CF']:
-            for k, v in data_by_year.get(year, {}).get(section, {}).items():
-                all_items.setdefault((section, k), True)
-
-    row = 2
-    for section, section_label in [("BS", "【资产负债表】"),
-                                    ("IS", "【利润表】"),
-                                    ("CF", "【现金流量表】")]:
-        items_in_section = [k for (s, k) in all_items.keys() if s == section]
-        if not items_in_section:
+    for sheet_type, sheet_label in [("BS", "资产负债表"), ("IS", "利润表"),
+                                      ("CF", "现金流量表")]:
+        merged_rows = extract_raw_table_wan_multi(
+            file_info, years, sheet_type, divide_by=1)  # 1 表示保持元
+        if not merged_rows:
             continue
-        cell = ws1.cell(row=row, column=1, value=section_label)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = cat_fill
-        ws1.merge_cells(start_row=row, start_column=1,
-                        end_row=row, end_column=len(years) + 1)
-        row += 1
-        for item in items_in_section:
-            ws1.cell(row=row, column=1, value=item)
-            for col_idx, year in enumerate(years, 2):
-                v = data_by_year.get(year, {}).get(section, {}).get(item)
-                cell = ws1.cell(row=row, column=col_idx)
-                if v is None:
-                    cell.value = "-"
-                elif isinstance(v, list):
-                    cell.value = str(v)
-                else:
-                    cell.value = v
-                    cell.number_format = "#,##0.00"
-            row += 1
-        row += 1
-    ws1.column_dimensions["A"].width = 35
-    for col_idx in range(2, len(years) + 2):
-        ws1.column_dimensions[get_column_letter(col_idx)].width = 18
+
+        if sheet_type == "BS":
+            # 双栏：左侧资产、右侧负债+权益
+            headers = ["资产(项目)", "期末余额(元)", "年初余额(元)",
+                       f"{sheet_label}(项目)", "期末余额(元)", "年初余额(元)"]
+            for col, h in enumerate(headers, 1):
+                cell = ws1.cell(row=1, column=col, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+            left_rows = [r for r in merged_rows if r['side'] == 'L']
+            right_rows = [r for r in merged_rows if r['side'] == 'R']
+            max_rows = max(len(left_rows), len(right_rows))
+            for i in range(max_rows):
+                row = i + 2
+                if i < len(left_rows):
+                    lr = left_rows[i]
+                    cell = ws1.cell(row=row, column=1, value=lr['account'])
+                    if lr['row_type'] == 'subheader':
+                        cell.font = cat_font
+                        cell.fill = cat_fill
+                        ws1.merge_cells(
+                            start_row=row, start_column=1, end_row=row,
+                            end_column=3)
+                        continue
+                    if lr['row_type'] == 'subtotal':
+                        cell.font = Font(bold=True)
+                    if lr['values']:
+                        latest_y = years[-1]
+                        v = lr['values'].get(latest_y, {}).get('end')
+                        cell = ws1.cell(row=row, column=2)
+                        if v is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v)
+                            cell.number_format = "#,##0.00"
+                        v2 = lr['values'].get(latest_y, {}).get('start')
+                        cell = ws1.cell(row=row, column=3)
+                        if v2 is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v2)
+                            cell.number_format = "#,##0.00"
+                if i < len(right_rows):
+                    rr = right_rows[i]
+                    cell = ws1.cell(row=row, column=4, value=rr['account'])
+                    if rr['row_type'] == 'subheader':
+                        cell.font = cat_font
+                        cell.fill = cat_fill
+                        ws1.merge_cells(
+                            start_row=row, start_column=4, end_row=row,
+                            end_column=6)
+                        continue
+                    if rr['row_type'] == 'subtotal':
+                        cell.font = Font(bold=True)
+                    if rr['values']:
+                        latest_y = years[-1]
+                        v = rr['values'].get(latest_y, {}).get('end')
+                        cell = ws1.cell(row=row, column=5)
+                        if v is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v)
+                            cell.number_format = "#,##0.00"
+                        v2 = rr['values'].get(latest_y, {}).get('start')
+                        cell = ws1.cell(row=row, column=6)
+                        if v2 is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v2)
+                            cell.number_format = "#,##0.00"
+            ws1.column_dimensions["A"].width = 30
+            ws1.column_dimensions["B"].width = 16
+            ws1.column_dimensions["C"].width = 16
+            ws1.column_dimensions["D"].width = 30
+            ws1.column_dimensions["E"].width = 16
+            ws1.column_dimensions["F"].width = 16
+            # 之后是 IS/CF 块，需要追加到同一个 Sheet
+        else:
+            # 单栏：IS / CF - 追加到"原始数据" Sheet
+            # 先加 2 行空行分隔
+            last_row = ws1.max_row
+            for r in range(last_row, last_row + 3):
+                ws1.cell(row=r, column=1, value="")
+
+            # 块标题
+            start_row = last_row + 4
+            cell = ws1.cell(row=start_row, column=1,
+                            value=f"【{sheet_label}】")
+            cell.font = cat_font
+            cell.fill = cat_fill
+            ws1.merge_cells(start_row=start_row, start_column=1,
+                            end_row=start_row, end_column=len(years) + 1)
+
+            # 表头
+            header_row = start_row + 1
+            ws1.cell(row=header_row, column=1, value="项目")
+            for col_idx, y in enumerate(years, 2):
+                ws1.cell(row=header_row, column=col_idx,
+                         value=f"{_yl(y)}(元)")
+            for col_idx in range(1, len(years) + 2):
+                c = ws1.cell(row=header_row, column=col_idx)
+                c.font = header_font
+                c.fill = header_fill
+                c.alignment = Alignment(horizontal="center")
+
+            # 数据
+            cur_row = header_row + 1
+            for r in merged_rows:
+                cell = ws1.cell(row=cur_row, column=1, value=r['account'])
+                if r['row_type'] == 'subheader':
+                    cell.font = cat_font
+                    cell.fill = cat_fill
+                    ws1.merge_cells(
+                        start_row=cur_row, start_column=1, end_row=cur_row,
+                        end_column=len(years) + 1)
+                    cur_row += 1
+                    continue
+                if r['row_type'] == 'subtotal':
+                    cell.font = Font(bold=True)
+                for col_idx, y in enumerate(years, 2):
+                    vals = r['values'].get(y, [])
+                    v = vals[0] if vals else None
+                    cell = ws1.cell(row=cur_row, column=col_idx)
+                    if v is None:
+                        cell.value = "-"
+                    else:
+                        cell.value = float(v)
+                        cell.number_format = "#,##0.00"
+                cur_row += 1
+
+    # ===== 原始报表(万元) - 保留所有原始科目行 =====
+    # 从 data_by_year 中提取 __files__ 信息
+    file_info = {}
+    for y in years:
+        yd = data_by_year.get(y, {})
+        if isinstance(yd, dict) and '__files__' in yd:
+            file_info[y] = yd['__files__']
+
+    for sheet_type, sheet_label in [("BS", "资产负债表"), ("IS", "利润表"),
+                                      ("CF", "现金流量表")]:
+        merged_rows = extract_raw_table_wan_multi(file_info, years, sheet_type)
+        if not merged_rows:
+            continue
+
+        sheet_name = f"原始报表(万元)-{sheet_label}"
+        ws_raw = wb.create_sheet(sheet_name)
+
+        if sheet_type == "BS":
+            headers = ["资产(项目)", "期末余额", "年初余额",
+                       f"{sheet_label}(项目)", "期末余额", "年初余额"]
+            for col, h in enumerate(headers, 1):
+                cell = ws_raw.cell(row=1, column=col, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+
+            left_rows = [r for r in merged_rows if r['side'] == 'L']
+            right_rows = [r for r in merged_rows if r['side'] == 'R']
+
+            max_rows = max(len(left_rows), len(right_rows))
+            for i in range(max_rows):
+                row = i + 2
+                if i < len(left_rows):
+                    lr = left_rows[i]
+                    cell = ws_raw.cell(row=row, column=1, value=lr['account'])
+                    if lr['row_type'] == 'subheader':
+                        cell.font = cat_font
+                        cell.fill = cat_fill
+                        ws_raw.merge_cells(
+                            start_row=row, start_column=1, end_row=row,
+                            end_column=3)
+                        continue
+                    if lr['row_type'] == 'subtotal':
+                        cell.font = Font(bold=True)
+                    if lr['values']:
+                        latest_y = years[-1]
+                        v = lr['values'].get(latest_y, {}).get('end')
+                        cell = ws_raw.cell(row=row, column=2)
+                        if v is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v)
+                            cell.number_format = "#,##0.00"
+                        v2 = lr['values'].get(latest_y, {}).get('start')
+                        cell = ws_raw.cell(row=row, column=3)
+                        if v2 is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v2)
+                            cell.number_format = "#,##0.00"
+                if i < len(right_rows):
+                    rr = right_rows[i]
+                    cell = ws_raw.cell(row=row, column=4, value=rr['account'])
+                    if rr['row_type'] == 'subheader':
+                        cell.font = cat_font
+                        cell.fill = cat_fill
+                        ws_raw.merge_cells(
+                            start_row=row, start_column=4, end_row=row,
+                            end_column=6)
+                        continue
+                    if rr['row_type'] == 'subtotal':
+                        cell.font = Font(bold=True)
+                    if rr['values']:
+                        latest_y = years[-1]
+                        v = rr['values'].get(latest_y, {}).get('end')
+                        cell = ws_raw.cell(row=row, column=5)
+                        if v is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v)
+                            cell.number_format = "#,##0.00"
+                        v2 = rr['values'].get(latest_y, {}).get('start')
+                        cell = ws_raw.cell(row=row, column=6)
+                        if v2 is None:
+                            cell.value = "-"
+                        else:
+                            cell.value = float(v2)
+                            cell.number_format = "#,##0.00"
+
+            ws_raw.column_dimensions["A"].width = 30
+            ws_raw.column_dimensions["B"].width = 14
+            ws_raw.column_dimensions["C"].width = 14
+            ws_raw.column_dimensions["D"].width = 30
+            ws_raw.column_dimensions["E"].width = 14
+            ws_raw.column_dimensions["F"].width = 14
+        else:
+            headers = ["项目"]
+            for y in years:
+                yl = _yl(y)
+                headers.append(f"{yl}(万元)")
+            for col, h in enumerate(headers, 1):
+                cell = ws_raw.cell(row=1, column=col, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+
+            for i, r in enumerate(merged_rows, 2):
+                cell = ws_raw.cell(row=i, column=1, value=r['account'])
+                if r['row_type'] == 'subheader':
+                    cell.font = cat_font
+                    cell.fill = cat_fill
+                    ws_raw.merge_cells(
+                        start_row=i, start_column=1, end_row=i,
+                        end_column=len(years) + 1)
+                    continue
+                if r['row_type'] == 'subtotal':
+                    cell.font = Font(bold=True)
+                for col_idx, y in enumerate(years, 2):
+                    vals = r['values'].get(y, [])
+                    v = vals[0] if vals else None
+                    cell = ws_raw.cell(row=i, column=col_idx)
+                    if v is None:
+                        cell.value = "-"
+                    else:
+                        cell.value = float(v)
+                        cell.number_format = "#,##0.00"
+            ws_raw.column_dimensions["A"].width = 35
+            for col_idx in range(2, len(years) + 2):
+                ws_raw.column_dimensions[get_column_letter(col_idx)].width = 16
 
     # ===== 财务指标（按年并列）=====
     ws2 = wb.create_sheet("财务指标")
@@ -1582,57 +2151,6 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
         ws_long.column_dimensions["C"].width = 32
         ws_long.column_dimensions["D"].width = 10
         ws_long.column_dimensions["E"].width = 20
-
-    # ===== 数据概览（万元单位）=====
-    if wide_table:
-        ws_wan = wb.create_sheet("数据概览(万元)")
-        # 年份转为可读字符串
-        def year_label(y):
-            if isinstance(y, tuple):
-                return f"{y[0]}-{str(y[1]).zfill(2)}"
-            return str(y)
-        # 表头
-        headers = ["报表类型", "会计科目", "单位"] + [year_label(y) for y in years]
-        for col, h in enumerate(headers, 1):
-            cell = ws_wan.cell(row=1, column=col, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
-        # 数据
-        row = 2
-        prev_section = None
-        for row_data in wide_table:
-            section = row_data["报表类型"]
-            if section != prev_section:
-                if prev_section is not None:
-                    row += 1
-                cell = ws_wan.cell(row=row, column=1, value=section)
-                cell.font = cat_font
-                cell.fill = cat_fill
-                ws_wan.merge_cells(
-                    start_row=row, start_column=1, end_row=row,
-                    end_column=len(years) + 3)
-                row += 1
-                prev_section = section
-            # 写数据（元 → 万元，除以 10000）
-            ws_wan.cell(row=row, column=1, value=row_data["报表类型"])
-            ws_wan.cell(row=row, column=2, value=row_data["会计科目"])
-            ws_wan.cell(row=row, column=3, value="万元")
-            for col_idx, year in enumerate(years, 4):
-                v = row_data.get(_yl(year))
-                cell = ws_wan.cell(row=row, column=col_idx)
-                if v is None:
-                    cell.value = "-"
-                else:
-                    # 元 → 万元，保留 2 位小数（强制 float 以保证小数位显示）
-                    cell.value = float(round(v / 10000, 2))
-                    cell.number_format = "#,##0.00"
-            row += 1
-        ws_wan.column_dimensions["A"].width = 14
-        ws_wan.column_dimensions["B"].width = 32
-        ws_wan.column_dimensions["C"].width = 8
-        for col_idx in range(4, len(years) + 4):
-            ws_wan.column_dimensions[get_column_letter(col_idx)].width = 18
 
     wb.save(output_path)
 
