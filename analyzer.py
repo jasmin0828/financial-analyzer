@@ -896,6 +896,12 @@ def extract_subjects_table(data_by_year, years):
         all_subjects,
         key=lambda x: (section_order.get(x[0], 99), x[1]))
 
+    def year_label(y):
+        """统一的年份字符串表示"""
+        if isinstance(y, tuple):
+            return f"{y[0]}-{str(y[1]).zfill(2)}"
+        return str(y)
+
     # 宽表：行=科目，列=年份
     wide_table = []
     for section, subject in sorted_subjects:
@@ -906,7 +912,7 @@ def extract_subjects_table(data_by_year, years):
             v = data.get(section, {}).get(subject)
             if isinstance(v, list):
                 v = v[0] if v else None
-            row[str(year)] = v
+            row[year_label(year)] = v
         wide_table.append(row)
 
     # 长表：每条记录一行
@@ -980,6 +986,12 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     cat_fill = style["cat_fill"]
     cat_font = style["cat_font"]
     up_fill = style["up_fill"]
+
+    def _yl(y):
+        """统一的年份字符串表示（处理 tuple/int）"""
+        if isinstance(y, tuple):
+            return f"{y[0]}-{str(y[1]).zfill(2)}"
+        return str(y)
     down_fill = style["down_fill"]
 
     # ===== 首页 =====
@@ -1520,7 +1532,7 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
             ws_wide.cell(row=row, column=1, value=row_data["报表类型"])
             ws_wide.cell(row=row, column=2, value=row_data["会计科目"])
             for col_idx, year in enumerate(years, 3):
-                v = row_data.get(str(year))
+                v = row_data.get(_yl(year))
                 cell = ws_wide.cell(row=row, column=col_idx)
                 if v is None:
                     cell.value = "-"
@@ -1558,6 +1570,57 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
         ws_long.column_dimensions["C"].width = 32
         ws_long.column_dimensions["D"].width = 10
         ws_long.column_dimensions["E"].width = 20
+
+    # ===== 数据概览（万元单位）=====
+    if wide_table:
+        ws_wan = wb.create_sheet("数据概览(万元)")
+        # 年份转为可读字符串
+        def year_label(y):
+            if isinstance(y, tuple):
+                return f"{y[0]}-{str(y[1]).zfill(2)}"
+            return str(y)
+        # 表头
+        headers = ["报表类型", "会计科目", "单位"] + [year_label(y) for y in years]
+        for col, h in enumerate(headers, 1):
+            cell = ws_wan.cell(row=1, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        # 数据
+        row = 2
+        prev_section = None
+        for row_data in wide_table:
+            section = row_data["报表类型"]
+            if section != prev_section:
+                if prev_section is not None:
+                    row += 1
+                cell = ws_wan.cell(row=row, column=1, value=section)
+                cell.font = cat_font
+                cell.fill = cat_fill
+                ws_wan.merge_cells(
+                    start_row=row, start_column=1, end_row=row,
+                    end_column=len(years) + 3)
+                row += 1
+                prev_section = section
+            # 写数据（元 → 万元，除以 10000）
+            ws_wan.cell(row=row, column=1, value=row_data["报表类型"])
+            ws_wan.cell(row=row, column=2, value=row_data["会计科目"])
+            ws_wan.cell(row=row, column=3, value="万元")
+            for col_idx, year in enumerate(years, 4):
+                v = row_data.get(_yl(year))
+                cell = ws_wan.cell(row=row, column=col_idx)
+                if v is None:
+                    cell.value = "-"
+                else:
+                    # 元 → 万元，保留 2 位小数（强制 float 以保证小数位显示）
+                    cell.value = float(round(v / 10000, 2))
+                    cell.number_format = "#,##0.00"
+            row += 1
+        ws_wan.column_dimensions["A"].width = 14
+        ws_wan.column_dimensions["B"].width = 32
+        ws_wan.column_dimensions["C"].width = 8
+        for col_idx in range(4, len(years) + 4):
+            ws_wan.column_dimensions[get_column_letter(col_idx)].width = 18
 
     wb.save(output_path)
 
