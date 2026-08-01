@@ -28,6 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: echo "VERSION=$(grep -E '^__version__' _version.py | cut -d'"' -f2)" >> $GITHUB_ENV
+
       - name: Run tests
         run: python test_logic.py
         continue-on-error: true
@@ -61,12 +66,32 @@ jobs:
         if: github.event_name == 'push'
         shell: bash
         run: |
-          tag="v$(date +'%Y%m%d-%H%M%S')"
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          tag="v${VERSION}"
           echo "Creating release: $tag"
           gh release create "$tag" \
             "./dist/财务分析工具.exe" \
-            --title "Financial Analyzer $tag" \
-            --generate-notes \
+            --title "财务分析工具 v${VERSION}" \
+            --notes "## 财务分析工具 v${VERSION}
+
+          🔧 构建时间: $(date '+%Y-%m-%d %H:%M:%S')
+          🐍 Python: 3.11
+          💻 Windows runner
+
+          ## 主要功能
+          - 多年财报支持（3+ 年趋势分析）
+          - 42 项财务指标（盈利/偿债/营运/现金流/发展/杜邦）
+          - 趋势分析（YoY 同比 + CAGR 复合增长率）
+          - Excel 原生图表（折线图 + 饼图）
+          - 科目表导出（宽格式 + 长格式 + CSV）
+          - 数据概览(万元) Sheet
+          - A 股双栏布局智能识别
+          - 季度/月份文件自动识别
+          - 年初余额自动补充
+
+          ## 隐私保护
+          - 🔒 全本地运行，数据不外传
+          - 🔒 适合处理敏感商业财报" \
             2>&1 || echo "Release creation skipped (artifact still available)"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

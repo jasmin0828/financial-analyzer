@@ -25,6 +25,7 @@ from analyzer import (
     generate_report, analyze_files, detect_year_from_filename,
     export_subjects_to_csv
 )
+from _version import __version__
 
 
 # ============================================================
@@ -71,7 +72,7 @@ class Worker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("财务分析工具 v2.0 - 本地版")
+        self.setWindowTitle(f"财务分析工具 v{__version__} - 本地版")
         self.setGeometry(80, 80, 1200, 850)
         self.file_list = []  # 待分析文件列表
         self.data_by_year = None
@@ -88,7 +89,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         # 标题
-        title = QLabel("💼 财务分析工具 v2.0")
+        title = QLabel(f"💼 财务分析工具 v{__version__}")
         title.setFont(QFont("Microsoft YaHei", 20, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #1F4E78; padding: 6px;")
@@ -98,6 +99,14 @@ class MainWindow(QMainWindow):
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet("color: #888; padding-bottom: 4px;")
         layout.addWidget(subtitle)
+
+        # 菜单栏 - 帮助
+        menubar = self.menuBar()
+        help_menu = menubar.addMenu("帮助")
+        about_action = help_menu.addAction("关于")
+        about_action.triggered.connect(self.show_about)
+        version_action = help_menu.addAction(f"版本 v{__version__}")
+        version_action.setEnabled(False)  # 仅显示，不可点击
 
         # 作者信息（固定署名）
         author_layout = QHBoxLayout()
@@ -350,6 +359,28 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "错误", msg)
         self.statusBar().showMessage("分析失败")
+
+    def show_about(self):
+        """显示关于对话框"""
+        QMessageBox.about(
+            self,
+            "关于",
+            f"<h3>财务分析工具 v{__version__}</h3>"
+            f"<p>本地运行的财务分析工具，全程不联网、数据不外传。</p>"
+            f"<p><b>核心功能：</b></p>"
+            f"<ul>"
+            f"<li>支持多年财报（3+ 年趋势分析）</li>"
+            f"<li>42 项财务指标（盈利/偿债/营运/现金流/发展/杜邦）</li>"
+            f"<li>趋势分析（YoY 同比 + CAGR 复合增长率）</li>"
+            f"<li>Excel 原生图表（折线图 + 饼图）</li>"
+            f"<li>科目表导出（宽表 + 长表 + CSV）</li>"
+            f"<li>支持 A 股标准双栏布局资产负债表</li>"
+            f"<li>季度/月份文件智能识别</li>"
+            f"<li>年初余额自动补充</li>"
+            f"</ul>"
+            f"<p><b>作者：</b>Jasmin Alpha Hunter</p>"
+            f"<p><b>构建日期：</b>{datetime.now().strftime('%Y-%m-%d')}</p>"
+        )
 
     def export_report(self):
         if not self.data_by_year:

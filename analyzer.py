@@ -13,6 +13,14 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
+# 工具版本号（遵循语义化版本 https://semver.org/）
+# 主版本.次版本.修订号（例如 2.5.0）
+# 变动规则：
+#   - 主版本：不兼容的大改动
+#   - 次版本：新增功能
+#   - 修订号：bug 修复
+__version__ = "2.5.0"
+
 import pandas as pd
 import openpyxl
 from openpyxl import Workbook
@@ -1003,13 +1011,17 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     ws0["A2"] = f"分析年份: {' / '.join(map(str, years))}  |  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     ws0["A2"].font = Font(italic=True, color="888888")
     ws0.merge_cells("A2:F2")
+    # 工具版本号
+    ws0["A3"] = f"🔧 工具版本: v{__version__}  |  报告生成日期: {datetime.now().strftime('%Y-%m-%d')}"
+    ws0["A3"].font = Font(italic=True, color="666666", size=9)
+    ws0.merge_cells("A3:F3")
     if analyst_name and analyst_name.strip():
-        ws0["A3"] = f"👤 分析人: {analyst_name.strip()}"
-        ws0["A3"].font = Font(bold=True, size=11, color="1F4E78")
-        ws0.merge_cells("A3:F3")
-        desc_start_row = 5
+        ws0["A4"] = f"👤 分析人: {analyst_name.strip()}"
+        ws0["A4"].font = Font(bold=True, size=11, color="1F4E78")
+        ws0.merge_cells("A4:F4")
+        desc_start_row = 6
     else:
-        desc_start_row = 4
+        desc_start_row = 5
 
     ws0.cell(row=desc_start_row, column=1, value="⚠️ 数据说明").font = Font(
         bold=True, size=12)
