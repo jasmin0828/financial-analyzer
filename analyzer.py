@@ -406,18 +406,30 @@ def extract_dual_column_bs(df):
 
 
 def parse_table(df, item_dict):
-    """从表格中按关键词匹配提取数据"""
+    """从表格中按关键词匹配提取数据（最长关键词优先原则）
+
+    改进：避免 "流动资产合计" 被 "流动资产" 误匹配。
+    策略：找所有匹配的行，选关键词最长的（即最具体的）。
+    """
     extracted = {}
     for std_name, keywords in item_dict.items():
+        best_row = None
+        best_keyword = ""
         for _, row in df.iterrows():
             row_str = " ".join([str(x) for x in row.values
                                 if pd.notna(x) and x is not None])
-            if any(kw in row_str for kw in keywords):
-                numbers = extract_numbers_from_row(list(row.values))
-                if numbers:
-                    # 取绝对值最大的数字（业务金额通常最大）
-                    extracted[std_name] = max(numbers, key=abs)
-                break
+            if not row_str:
+                continue
+            # 在该行中找最长的匹配关键词
+            for kw in keywords:
+                if kw in row_str and len(kw) > len(best_keyword):
+                    best_row = row
+                    best_keyword = kw
+        if best_row is not None:
+            numbers = extract_numbers_from_row(list(best_row.values))
+            if numbers:
+                # 取绝对值最大的数字（业务金额通常最大）
+                extracted[std_name] = max(numbers, key=abs)
     return extracted
 
 
