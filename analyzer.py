@@ -989,12 +989,15 @@ def export_subjects_to_csv(data_by_year, years, output_path):
 # ============================================================
 
 def extract_raw_table_wan(file_path, sheet_type="BS", divide_by=10000):
-    """从原始 Excel 提取所有行
+    """从原始 Excel 提取所有行（支持多 sheet）
 
     保留完整的原始科目结构（不标准化），包括：
     - 所有非标准科目（如"短期投资""预付款项""累计折旧"等）
     - 分类标题行（如"流动资产：""非流动资产：")
     - 空行
+
+    支持多 sheet：自动遍历所有 sheet，合并属于指定 sheet_type 的内容。
+    例如：BS 拆成"资产负债表"和"资产负债表（续）"两个 sheet 时也能完整提取。
 
     Args:
         file_path: Excel 文件路径
@@ -1012,7 +1015,58 @@ def extract_raw_table_wan(file_path, sheet_type="BS", divide_by=10000):
                 'start_val': 年初值（divide_by 后，如果有）,
             }
     """
-    df = pd.read_excel(file_path, header=None, dtype=str)
+    rows = []
+
+    try:
+        xls = pd.ExcelFile(file_path, engine='openpyxl')
+    except Exception:
+        return rows
+
+    # 遍历所有 sheet，提取属于指定 sheet_type 的内容
+    for sheet_name in xls.sheet_names:
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name,
+                               header=None, dtype=str)
+        except Exception:
+            continue
+
+        # 判断是否属于目标 sheet_type
+        detected = detect_sheet_type(sheet_name, df)
+        if detected != sheet_type:
+            continue
+
+        # 判断这个 sheet 是 "资产/左侧" 还是 "负债+权益/右侧"
+        # 逻辑：包含"（续）"、以"负债"或"所有者"开头、明确包含"负债部分" → 'R'
+        # 其他（资产负债表、流动资产） → 'L'
+        side = 'L'
+        if sheet_type == "BS":
+            # 续表表示（如"资产负债表（续）"）
+            if "（续）" in sheet_name or "续表" in sheet_name:
+                side = 'R'
+            # 以"负债"或"所有者"开头
+            elif sheet_name.startswith("负债") or sheet_name.startswith("所有者"):
+                side = 'R'
+
+        # 提取这个 sheet 的行（传 side 参数）
+        sheet_rows = _extract_raw_rows_from_df(
+            df, sheet_type, divide_by, side=side)
+        rows.extend(sheet_rows)
+
+    return rows
+
+
+def _extract_raw_rows_from_df(df, sheet_type, divide_by, side='L'):
+    """从单个 sheet 的 DataFrame 提取所有行（私有 helper）
+
+    支持双栏和单栏布局，分别处理 BS/IS/CF。
+
+    Args:
+        df: pandas DataFrame
+        sheet_type: 'BS'/'IS'/'CF'
+        divide_by: 数值除数
+        side: 'L' 或 'R'。单栏布局下，这个 sheet 的内容标记为哪一边。
+             默认 'L'（资产或独立表）。
+    """
     rows = []
 
     if sheet_type == "BS" and is_dual_column_layout(df):
@@ -1146,8 +1200,10 @@ def extract_raw_table_wan(file_path, sheet_type="BS", divide_by=10000):
         for i, row in df.iterrows():
             row_str = " ".join([str(v) for v in row.values
                                 if v is not None and not (isinstance(v, float) and pd.isna(v))])
-            if "项目" in row_str or "科目" in row_str or "本年" in row_str:
-                if any(kw in row_str for kw in ["行次", "金额", "累计"]):
+            # 去空格后再判断（避免"项 目"中间空格漏匹配）
+            row_str_clean = row_str.replace(" ", "").replace("\u3000", "")
+            if "项目" in row_str_clean or "科目" in row_str_clean or "本年" in row_str_clean:
+                if any(kw in row_str_clean for kw in ["行次", "金额", "累计", "余额"]):
                     header_row_idx = i
                     break
         if header_row_idx is None:
@@ -1218,12 +1274,18 @@ def extract_raw_table_wan(file_path, sheet_type="BS", divide_by=10000):
             else:
                 row_type = 'data'
 
+            # 统一字段名：双栏用 end_val/start_val，单栏也用同样的字段名
+            end_val = vals[0] if len(vals) > 0 else None
+            start_val = vals[1] if len(vals) > 1 else None
+
             rows.append({
-                'side': 'L',
+                'side': side,
                 'row_type': row_type,
                 'account': stripped,
                 'row_no': row_no,
-                'values': vals,
+                'end_val': end_val,
+                'start_val': start_val,
+                'values': vals,  # 保留以兼容
             })
 
     return rows
@@ -1312,9 +1374,118 @@ def extract_raw_table_wan_multi(file_info, years, sheet_type, divide_by=10000):
 
 
 # ============================================================
-# 报告生成
+# 同比变化 Sheet 生成
 # ============================================================
 
+def _yl(y):
+    """统一的年份字符串表示（处理 tuple/int）"""
+    if isinstance(y, tuple):
+        return f"{y[0]}-{str(y[1]).zfill(2)}"
+    return str(y)
+
+
+def _write_change_sheet(wb, data_by_year, years, header_font,
+                          header_fill, cat_font, cat_fill, divide_by=10000):
+    """生成「同比变化」Sheet
+
+    显示每个会计科目在多年间的变化情况：
+    - 单年数据：Sheet 只有说明文字
+    - 多年数据：列出每个科目每年的数值 + 相邻年变化率
+    """
+    if len(years) < 2:
+        ws = wb.create_sheet("同比变化")
+        ws.cell(row=1, column=1, value="⚠️ 只需 1 年数据，无同比")
+        ws.cell(row=2, column=1, value="如需变化分析，请提供多年财报（如 2024 和 2025 年）")
+        ws.column_dimensions["A"].width = 50
+        return
+
+    # 收集所有 (section, account) 组合
+    all_subjects = set()
+    for y in years:
+        for section in ['BS', 'IS', 'CF']:
+            for account in data_by_year.get(y, {}).get(section, {}).keys():
+                all_subjects.add((section, account))
+
+    section_order = {'BS': 0, 'IS': 1, 'CF': 2}
+    sorted_subjects = sorted(all_subjects, key=lambda x: (section_order.get(x[0], 99), x[1]))
+
+    unit_label = "万元" if divide_by == 10000 else "元"
+
+    ws = wb.create_sheet("同比变化")
+    # 表头
+    headers = ["报表类型", "会计科目", "单位"]
+    for y in years:
+        headers.append(f"{_yl(y)}({unit_label})")
+    for i in range(len(years) - 1):
+        headers.append(f"{_yl(years[i])}→{_yl(years[i+1])} 变化率")
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # 数据
+    row = 2
+    prev_section = None
+    for section, account in sorted_subjects:
+        if section != prev_section:
+            if prev_section is not None:
+                row += 1
+            cell = ws.cell(row=row, column=1, value=SECTION_LABELS[section][0])
+            cell.font = cat_font
+            cell.fill = cat_fill
+            ws.merge_cells(
+                start_row=row, start_column=1, end_row=row,
+                end_column=len(headers))
+            row += 1
+            prev_section = section
+        # 写一行数据
+        ws.cell(row=row, column=1, value=SECTION_LABELS[section][0])
+        ws.cell(row=row, column=2, value=account)
+        ws.cell(row=row, column=3, value=unit_label)
+        # 每年值
+        for col_idx, y in enumerate(years, 4):
+            v = data_by_year.get(y, {}).get(section, {}).get(account)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            cell = ws.cell(row=row, column=col_idx)
+            if v is None:
+                cell.value = "-"
+            else:
+                cell.value = float(v / divide_by)
+                cell.number_format = "#,##0.00"
+        # 相邻年变化率
+        for i, y in enumerate(years[:-1]):
+            v_curr = data_by_year.get(years[i+1], {}).get(section, {}).get(account)
+            v_prev = data_by_year.get(years[i], {}).get(section, {}).get(account)
+            if isinstance(v_curr, list):
+                v_curr = v_curr[0] if v_curr else None
+            if isinstance(v_prev, list):
+                v_prev = v_prev[0] if v_prev else None
+            cell = ws.cell(row=row, column=len(years) + 3 + i + 1)
+            if v_curr is None or v_prev is None or v_prev == 0:
+                cell.value = "-"
+            else:
+                change = (v_curr - v_prev) / abs(v_prev) * 100
+                if change > 0.5:
+                    cell.value = f"↑ {change:+.2f}%"
+                elif change < -0.5:
+                    cell.value = f"↓ {change:+.2f}%"
+                else:
+                    cell.value = f"→ {change:+.2f}%"
+        row += 1
+
+    # 列宽
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 32
+    ws.column_dimensions["C"].width = 8
+    for col_idx in range(4, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+
+
+# ============================================================
+# 报告生成
+# ============================================================
 def _header_style():
     return {
         "header_font": Font(bold=True, size=12, color="FFFFFF"),
@@ -1346,7 +1517,7 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
     cat_font = style["cat_font"]
     up_fill = style["up_fill"]
 
-    def _yl(y):
+    def _yl(y):  # noqa: F841 - 保留以向后兼容
         """统一的年份字符串表示（处理 tuple/int）"""
         if isinstance(y, tuple):
             return f"{y[0]}-{str(y[1]).zfill(2)}"
@@ -2163,6 +2334,10 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
         ws_long.column_dimensions["C"].width = 32
         ws_long.column_dimensions["D"].width = 10
         ws_long.column_dimensions["E"].width = 20
+
+    # ===== 同比变化 Sheet =====
+    _write_change_sheet(wb, data_by_year, years,
+                          header_font, header_fill, cat_font, cat_fill)
 
     wb.save(output_path)
 
