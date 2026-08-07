@@ -1183,6 +1183,7 @@ def _extract_raw_rows_from_df(df, sheet_type, divide_by, side='L'):
                     'row_type': row_type,
                     'account': stripped,
                     'row_no': row_no,
+                    'df_index': i,
                     'end_val': end_val,
                     'start_val': start_val,
                 }
@@ -1283,6 +1284,7 @@ def _extract_raw_rows_from_df(df, sheet_type, divide_by, side='L'):
                 'row_type': row_type,
                 'account': stripped,
                 'row_no': row_no,
+                'df_index': i,  # 原始 df 物理行号，用于按报表顺序排序
                 'end_val': end_val,
                 'start_val': start_val,
                 'values': vals,  # 保留以兼容
@@ -1384,40 +1386,117 @@ def _yl(y):
     return str(y)
 
 
-def _write_change_sheet(wb, data_by_year, years, header_font,
-                          header_fill, cat_font, cat_fill, divide_by=10000):
-    """生成「同比变化」Sheet
+def _write_change_sheet(wb, data_by_year, years, file_info,
+                          header_font, header_fill, cat_font, cat_fill,
+                          divide_by=10000):
+    """生成「期末较期初变化」Sheet
 
-    显示每个会计科目在多年间的变化情况：
-    - 单年数据：Sheet 只有说明文字
-    - 多年数据：列出每个科目每年的数值 + 相邻年变化率
+    对每份报表的“期末余额”与“年初余额”两列直接计算变化率和变化额。
+    不需要多年数据（单份报表也能看期初→期末变化）。
+
+    Args:
+        file_info: {year: {section: filepath}}
     """
-    if len(years) < 2:
-        ws = wb.create_sheet("同比变化")
-        ws.cell(row=1, column=1, value="⚠️ 只需 1 年数据，无同比")
-        ws.cell(row=2, column=1, value="如需变化分析，请提供多年财报（如 2024 和 2025 年）")
+    if not file_info:
+        ws = wb.create_sheet("期末较期初变化")
+        ws.cell(row=1, column=1, value="⚠️ 无文件信息")
         ws.column_dimensions["A"].width = 50
         return
 
-    # 收集所有 (section, account) 组合
-    all_subjects = set()
-    for y in years:
-        for section in ['BS', 'IS', 'CF']:
-            for account in data_by_year.get(y, {}).get(section, {}).keys():
-                all_subjects.add((section, account))
+    # 收集每个 (year, section, account) → (期末, 期初)
+    # 从原始 Excel 文件读期初/期末（不依赖 data_by_year）
+    period_data = {}
+    for year, sections in file_info.items():
+        for section, path in sections.items():
+            if section not in ('BS', 'IS', 'CF'):
+                continue
+            try:
+                rows = extract_raw_table_wan(path, section, divide_by=1)
+            except Exception:
+                continue
+            for r in rows:
+                if r.get('row_type') in ('subheader', 'blank'):
+                    continue
+                account = r.get('account', '').strip()
+                if not account:
+                    continue
+                # 提取期初/期末
+                if section == 'BS':
+                    end = r.get('end_val')
+                    start = r.get('start_val')
+                else:
+                    vals = r.get('values', [])
+                    end = vals[0] if len(vals) > 0 else None
+                    start = vals[1] if len(vals) > 1 else None
+                if end is None and start is None:
+                    continue
+                period_data[(year, section, account)] = (end, start)
 
+    if not period_data:
+        ws = wb.create_sheet("期末较期初变化")
+        ws.cell(row=1, column=1, value="⚠️ 未能从报表提取期初/期末数据")
+        ws.column_dimensions["A"].width = 50
+        return
+
+    # 收集所有原始 row（含 side, df_index, account）
+    all_raw_rows = []
+    for year, sections in file_info.items():
+        for section, path in sections.items():
+            if section not in ('BS', 'IS', 'CF'):
+                continue
+            try:
+                rows = extract_raw_table_wan(path, section, divide_by=1)
+            except Exception:
+                continue
+            for r in rows:
+                if r.get('row_type') in ('subheader', 'blank'):
+                    continue
+                account = r.get('account', '').strip()
+                if not account:
+                    continue
+                # 提取期初/期末
+                if section == 'BS':
+                    end = r.get('end_val')
+                    start = r.get('start_val')
+                else:
+                    vals = r.get('values', [])
+                    end = vals[0] if len(vals) > 0 else None
+                    start = vals[1] if len(vals) > 1 else None
+                if end is None and start is None:
+                    continue
+                all_raw_rows.append({
+                    'year': year,
+                    'section': section,
+                    'side': r.get('side', 'L'),
+                    'account': account,
+                    'df_index': r.get('df_index', 0),
+                    'end': end,
+                    'start': start,
+                })
+
+    if not all_raw_rows:
+        ws = wb.create_sheet("期末较期初变化")
+        ws.cell(row=1, column=1, value="⚠️ 未能从报表提取期初/期末数据")
+        ws.column_dimensions["A"].width = 50
+        return
+
+    # 按报表物理顺序排序：
+    # - BS: 先 side='L'（资产）按 df_index，再 side='R'（负债）按 df_index
+    # - IS/CF: 只有一个 side='L'，按 df_index
     section_order = {'BS': 0, 'IS': 1, 'CF': 2}
-    sorted_subjects = sorted(all_subjects, key=lambda x: (section_order.get(x[0], 99), x[1]))
+    side_order = {'L': 0, 'R': 1}
+    sorted_rows = sorted(
+        all_raw_rows,
+        key=lambda x: (section_order.get(x['section'], 99),
+                        side_order.get(x['side'], 0),
+                        x['df_index']))
 
     unit_label = "万元" if divide_by == 10000 else "元"
 
-    ws = wb.create_sheet("同比变化")
+    ws = wb.create_sheet("期末较期初变化")
     # 表头
-    headers = ["报表类型", "会计科目", "单位"]
-    for y in years:
-        headers.append(f"{_yl(y)}({unit_label})")
-    for i in range(len(years) - 1):
-        headers.append(f"{_yl(years[i])}→{_yl(years[i+1])} 变化率")
+    headers = ["报表类型", "会计科目", "单位", "年份",
+               "期初余额", "期末余额", "变化额", "变化率"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = header_font
@@ -1427,7 +1506,10 @@ def _write_change_sheet(wb, data_by_year, years, header_font,
     # 数据
     row = 2
     prev_section = None
-    for section, account in sorted_subjects:
+    prev_side = None
+    for r in sorted_rows:
+        section = r['section']
+        side = r['side']
         if section != prev_section:
             if prev_section is not None:
                 row += 1
@@ -1439,48 +1521,57 @@ def _write_change_sheet(wb, data_by_year, years, header_font,
                 end_column=len(headers))
             row += 1
             prev_section = section
-        # 写一行数据
+            prev_side = None
+        end = r['end']
+        start = r['start']
         ws.cell(row=row, column=1, value=SECTION_LABELS[section][0])
-        ws.cell(row=row, column=2, value=account)
+        ws.cell(row=row, column=2, value=r['account'])
         ws.cell(row=row, column=3, value=unit_label)
-        # 每年值
-        for col_idx, y in enumerate(years, 4):
-            v = data_by_year.get(y, {}).get(section, {}).get(account)
-            if isinstance(v, list):
-                v = v[0] if v else None
-            cell = ws.cell(row=row, column=col_idx)
-            if v is None:
-                cell.value = "-"
+        ws.cell(row=row, column=4, value=_yl(r['year']))
+        # 期初
+        cell = ws.cell(row=row, column=5)
+        if start is not None:
+            cell.value = float(start / divide_by)
+            cell.number_format = "#,##0.00"
+        else:
+            cell.value = "-"
+        # 期末
+        cell = ws.cell(row=row, column=6)
+        if end is not None:
+            cell.value = float(end / divide_by)
+            cell.number_format = "#,##0.00"
+        else:
+            cell.value = "-"
+        # 变化额
+        cell = ws.cell(row=row, column=7)
+        if start is not None and end is not None:
+            cell.value = float((end - start) / divide_by)
+            cell.number_format = "#,##0.00;[Red]-#,##0.00"
+        else:
+            cell.value = "-"
+        # 变化率
+        cell = ws.cell(row=row, column=8)
+        if start is not None and end is not None and start != 0:
+            change = (end - start) / abs(start) * 100
+            if change > 0.5:
+                cell.value = f"↑ {change:+.2f}%"
+            elif change < -0.5:
+                cell.value = f"↓ {change:+.2f}%"
             else:
-                cell.value = float(v / divide_by)
-                cell.number_format = "#,##0.00"
-        # 相邻年变化率
-        for i, y in enumerate(years[:-1]):
-            v_curr = data_by_year.get(years[i+1], {}).get(section, {}).get(account)
-            v_prev = data_by_year.get(years[i], {}).get(section, {}).get(account)
-            if isinstance(v_curr, list):
-                v_curr = v_curr[0] if v_curr else None
-            if isinstance(v_prev, list):
-                v_prev = v_prev[0] if v_prev else None
-            cell = ws.cell(row=row, column=len(years) + 3 + i + 1)
-            if v_curr is None or v_prev is None or v_prev == 0:
-                cell.value = "-"
-            else:
-                change = (v_curr - v_prev) / abs(v_prev) * 100
-                if change > 0.5:
-                    cell.value = f"↑ {change:+.2f}%"
-                elif change < -0.5:
-                    cell.value = f"↓ {change:+.2f}%"
-                else:
-                    cell.value = f"→ {change:+.2f}%"
+                cell.value = f"→ {change:+.2f}%"
+        else:
+            cell.value = "-"
         row += 1
 
     # 列宽
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 32
     ws.column_dimensions["C"].width = 8
-    for col_idx in range(4, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 16
+    ws.column_dimensions["D"].width = 12
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["H"].width = 14
 
 
 # ============================================================
@@ -2335,8 +2426,13 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
         ws_long.column_dimensions["D"].width = 10
         ws_long.column_dimensions["E"].width = 20
 
-    # ===== 同比变化 Sheet =====
-    _write_change_sheet(wb, data_by_year, years,
+    # ===== 期末较期初变化 Sheet =====
+    file_info = {}
+    for y in years:
+        yd = data_by_year.get(y, {})
+        if isinstance(yd, dict) and '__files__' in yd:
+            file_info[y] = yd['__files__']
+    _write_change_sheet(wb, data_by_year, years, file_info,
                           header_font, header_fill, cat_font, cat_fill)
 
     wb.save(output_path)
