@@ -1494,17 +1494,30 @@ def _write_change_sheet(wb, data_by_year, years, file_info,
     unit_label = "万元" if divide_by == 10000 else "元"
 
     ws = wb.create_sheet("期末较期初变化")
+    # 顶部加目录
+    toc_parts = []
+    for st, sl in [("BS", "资产负债表"), ("IS", "利润表"), ("CF", "现金流量表")]:
+        year_list = [y for y in years if y in file_info and st in file_info[y]]
+        if year_list:
+            year_str = ", ".join(_yl(y) for y in year_list)
+            toc_parts.append(f"{sl} ({year_str})")
+    if toc_parts:
+        toc_cell = ws.cell(row=1, column=1, value="📋 目录: " + " | ".join(toc_parts))
+        toc_cell.font = Font(bold=True, color="FFFFFF", size=11)
+        toc_cell.fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+        ws.row_dimensions[1].height = 22
     # 表头
     headers = ["报表类型", "会计科目", "单位", "年份",
                "期初余额", "期末余额", "变化额", "变化率"]
     for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
+        cell = ws.cell(row=2, column=col, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    # 数据
-    row = 2
+    # 数据（从第 3 行开始，第 1 行是目录，第 2 行是表头）
+    row = 3
     prev_section = None
     prev_side = None
     for r in sorted_rows:
@@ -1512,6 +1525,21 @@ def _write_change_sheet(wb, data_by_year, years, file_info,
         side = r['side']
         if section != prev_section:
             if prev_section is not None:
+                row += 1
+            # 加分页提示（醒目大字）
+            if prev_section is not None:  # 不是第一个分类才加分页
+                section_emoji = "💰" if section == "IS" else "💵"
+                section_color = "548235" if section == "IS" else "7030A0"
+                divider_row = row
+                cell = ws.cell(row=divider_row, column=1,
+                                value=f"{section_emoji} {section_emoji} {section_emoji} 【{SECTION_LABELS[section][0]}】 {section_emoji} {section_emoji} {section_emoji}")
+                cell.font = Font(bold=True, color="FFFFFF", size=12)
+                cell.fill = PatternFill(start_color=section_color, end_color=section_color, fill_type="solid")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                ws.merge_cells(
+                    start_row=divider_row, start_column=1,
+                    end_row=divider_row, end_column=len(headers))
+                ws.row_dimensions[divider_row].height = 25
                 row += 1
             cell = ws.cell(row=row, column=1, value=SECTION_LABELS[section][0])
             cell.font = cat_font
@@ -1674,6 +1702,22 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
 
     # 原始数据 Sheet（元单位，保留所有原始行）
     ws1 = wb.create_sheet("原始数据")
+    # 顶部加目录行（点哪个跳转哪个区域）
+    toc_parts = []
+    if file_info:
+        for st, sl in [("BS", "资产负债表"), ("IS", "利润表"), ("CF", "现金流量表")]:
+            year_list = [y for y in years if y in file_info and st in file_info[y]]
+            if year_list:
+                year_str = ", ".join(_yl(y) for y in year_list)
+                toc_parts.append(f"{sl} ({year_str})")
+    if toc_parts:
+        toc_cell = ws1.cell(row=1, column=1, value="📋 目录: " + " | ".join(toc_parts))
+        toc_cell.font = Font(bold=True, color="FFFFFF", size=11)
+        toc_cell.fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
+        ws1.row_dimensions[1].height = 22
+    toc_offset = 2  # 后续数据从第 2 行开始
+
     for sheet_type, sheet_label in [("BS", "资产负债表"), ("IS", "利润表"),
                                       ("CF", "现金流量表")]:
         merged_rows = extract_raw_table_wan_multi(
@@ -1683,10 +1727,11 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
 
         if sheet_type == "BS":
             # 双栏：左侧资产、右侧负债+权益
+            # 表头从 row 2 开始（row 1 是目录）
             headers = ["资产(项目)", "期末余额(元)", "年初余额(元)",
                        f"{sheet_label}(项目)", "期末余额(元)", "年初余额(元)"]
             for col, h in enumerate(headers, 1):
-                cell = ws1.cell(row=1, column=col, value=h)
+                cell = ws1.cell(row=2, column=col, value=h)
                 cell.font = header_font
                 cell.fill = header_fill
                 cell.alignment = Alignment(horizontal="center")
@@ -1694,7 +1739,7 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
             right_rows = [r for r in merged_rows if r['side'] == 'R']
             max_rows = max(len(left_rows), len(right_rows))
             for i in range(max_rows):
-                row = i + 2
+                row = i + 3
                 if i < len(left_rows):
                     lr = left_rows[i]
                     cell = ws1.cell(row=row, column=1, value=lr['account'])
@@ -1760,13 +1805,26 @@ def generate_report(data_by_year, indicators_by_year, years, trends,
             # 之后是 IS/CF 块，需要追加到同一个 Sheet
         else:
             # 单栏：IS / CF - 追加到"原始数据" Sheet
-            # 先加 2 行空行分隔
+            # 加醒目的分页提示（3 行高度 + 大字背景）
             last_row = ws1.max_row
-            for r in range(last_row, last_row + 3):
+            # 空行
+            for r in range(last_row + 1, last_row + 4):
                 ws1.cell(row=r, column=1, value="")
+            # 大字分页提示
+            divider_row = last_row + 4
+            section_color = "548235" if sheet_type == "IS" else "7030A0"
+            section_emoji = "💰" if sheet_type == "IS" else "💵"
+            cell = ws1.cell(row=divider_row, column=1,
+                            value=f"{section_emoji} {section_emoji} {section_emoji} 下面开始是【{sheet_label}】数据 {section_emoji} {section_emoji} {section_emoji}")
+            cell.font = Font(bold=True, color="FFFFFF", size=13)
+            cell.fill = PatternFill(start_color=section_color, end_color=section_color, fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws1.merge_cells(start_row=divider_row, start_column=1,
+                            end_row=divider_row, end_column=len(years) + 1)
+            ws1.row_dimensions[divider_row].height = 30
 
             # 块标题
-            start_row = last_row + 4
+            start_row = last_row + 6
             cell = ws1.cell(row=start_row, column=1,
                             value=f"【{sheet_label}】")
             cell.font = cat_font
